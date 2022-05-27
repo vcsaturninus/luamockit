@@ -1,2 +1,2 @@
 # luamockit
-C library for timer-registered callbacks in Lua
+C and Lua library for timer-registered callbacks.
