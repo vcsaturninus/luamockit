@@ -12,7 +12,8 @@
    The above has a host of potential solutions but all of them fall somehow short
    or prove inconvenient.
 
-   * * * Saving lua states/threads
+   Saving lua states/threads
+   ----------------------------
 
    If using coroutines, each one has its own lua thread, and a C function that gets
    called might therefore be called with a lua_State other than the main one.
@@ -24,12 +25,13 @@
    they must be ANCHORED, either via assignment to a lua variable or by saving them
    in the lua REGISTRY.
    
-   * * * USING A SINGLE GLOBAL STATE
+   USING A SINGLE GLOBAL STATE
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
    To do away with this nuisance, an alternative would be to save the state passed
    to the first function that opens the library in a global variable to be used by
-   all the functions inthe C library that call back into LUA. However, there's no
-   guarantee that this state is actually the main state of LUA -- again, if
+   all the functions in the C library that call back into Lua. However, there's no
+   guarantee that this state is actually the main state of Lua -- again, if
    coroutines are used.
 
    The above two points are made to emphasize the following: 
@@ -37,14 +39,16 @@
    This library is expected to be called from lua scripts with a single lua state.
    
    -- Unless passed the main lua thread/state (which is the case if there's a SINGLE
-   lua state/thread i.e. when coroutines aren't used), the state must BE anchored to
+   lua state/thread i.e. when coroutines aren't used), the state must be ANCHORED to
    ensure it doesn't get garbage collected leading to a crash when a call back into it
    happens.
-   This library will anchor the state the lua_get_interval_timer and lua_get_oneoff_timer()
-   functions get called with, adn therefore CAN be used even from scripts employing 
-   coroutines, but the library can't promise correct behavior.
+   This library will anchor the state the Mockit_get_interval_timer() and 
+   Mockit_register_oneoff_callback() functions get called with, and therefore CAN 
+   be used even from scripts employing coroutines, but the library can't promise correct 
+   behavior.
 
-   * * * Asynchronously calling back into a Lua State
+   Asynchronously calling back into a Lua State
+   ----------------------------------------------
 
    Even with the above points in mind, the main problem is that one CANNOT call back 
    into a lua state asynchronously.
@@ -54,6 +58,7 @@
    same lua state will inevitably end badly. 
 
    This problem has two solutions:
+
    1) each POSIX thread can have its own lua State.
    This has a whole host of disadvantages: each state is completely separate. The state,
    which will be a whole new lua instance, must be opened, populated with the required
@@ -63,8 +68,7 @@
 
 
    2) Mutexes must be used to serialize the POSIX threads' interaction with the lua state.
-   This avoids the inevitable race conditions and is the approach the luamockit library
-   went with. 
+   This avoids the inevitable race conditions.  
 
    HOWEVER, 2) has another glaring problem: if multiple libraries are used and they all
    take the same aproach, then chaos ensues.
@@ -83,16 +87,21 @@
    ------------------------------------------------------------------------------------
    The approach this library ultimately settled on is all about giving the power to lua
    itself.
-   Interval and one-off timers generate an 'event' on expiration. This event gets added
-   to a global event queue in this library.
-   At no point is LUA called back asynchronously.
-   The queue simply gets populated, from multiple threads, (and therefore enqueing
-   and dequeing operations must be protected by a mutex to ensure serialization).
+   Interval and one-off timers generate an 'event' on expiration. The event is simply 
+   a structure that contains some internal details, primarily the lua callback associated
+   with this event that must be called back as a result of the timer having expired. 
+   This event gets added to a global event queue in this library.
+
+   * At no point is LUA called back asynchronously. *
+
+   The queue simply gets populated, from multiple threads (and therefore enqueing
+   and dequeing operations must be and are protected by a mutex to ensure serialization).
 
    The lua script itself must periodically call the lua_process_events() function
-   which will go through the event queue and dequeue each pending event and handle it.
-   Each event amounts to a callback that must be called (the same or a different
-   callback).
+   which will go through the event queue and dequeue each pending event and 'handle' it.
+   To handle an event means to call the Lua callback associated with it, and then
+   remove it from the event queue.
+    
    Therefore each call to lua_process_events() has a backlog that it needs to clear.
    The rarer lua_process_events() gets called, the bigger the backlog and the less 
    precise the timers. 
@@ -106,34 +115,33 @@
    possible : or, specifically, about as frequently as the callback with the shortest
    interval timer.
 
-   This also means that a certain design is unfortunately imposed on the lua script
-   especially if interval timer callbacks are going to be used. 
-   The script will most often necessarily take the form of an infinite loop that
-   mostly sleeps and then calls the lua_process_events() function on every wakeup.
+   To solve the above problem another function is provided - `lua_wait_for_events()` - 
+   which makes a blocking call to wait on the list to be populated. It unblocks as
+   soon as an event is added to the list. Note that if there are events in the queue,
+   this function still blocks and will only unblock when a NEW event gets added.
+   It's therefore advisable that the user either calls this function before any events
+   get created (i.e. before setting up any timers) or after emptying the queue with
+   `lua_process_events()`. With the above in mind, a possible undesirable scenario
+   is that the function gets called after some events have already been generated
+   but without any new events being generated, with the result that the function
+   will block forever and the events end up never being handled. To account for this
+   possibility, `lua_wait()` takes an optional parameter, `timeout`. The blocking call
+   will unblock either as soon as a new event is generated or after timeout milliseconds
+   -- whichever comes first.
+   
+   Lua script design
+   --------------------
+
+   The above points mean that a certain design naturally imposes itself for a lua script
+   using the interval timers feature of this library (though this is by no means mandatory).
+   The script will most often take the form of an infinite loop that blocks with 
+   `lua_wait()` and then calls `lua_process_events()` every time it unblocks.
  
    This makes it most suited to scripts meant to be running as daemons. This might
    not be as much of a problem as it sounds, since that's exactly the context where
-   one would typically even want to have callbacks called at certain intervals:
-   event loops dispatching events.
-
-   ------------------------------- Blocking Call and pipes ------------------------------
-   
-   The above led to an implmentation where the lua script making use of this library would 
-   sit in an infinite loop and periodically eg once a second check the event queue, then
-   go back to sleep either after processing of after determining there's no processing to
-   be done. This constant polling is inefficient and limits the accuracy of the callback
-   timers, as discussed above. 
-   A both more efficient and more accurate implementation is to instead make a blocking
-   from lua to a C function in the main thread, which would block waiting for some kind
-   of signal from a worker thread that adds events to the event queue. This signal can
-   be, for example, one of two things:
-     * signalling a condition variable that the blocking function is waiting on
-     * writing to the read end of a pipe that the blocking function has blocked 
-       trying to read() from.
-
-   The `usage.md` doc in the current working directory shows how to use this library from
-   both C and lua.
-   ========================================================================================
+   one would typically even want to have callbacks called asynchronously or at certain 
+   intervals: event loops dispatching events.
+   ===================================================================================
  */
 
 #include <errno.h>
@@ -141,6 +149,7 @@
 #include <assert.h>
 #include <stdlib.h>          // exit()
 #include <semaphore.h>       // named and unnamed POSIX semaphores
+#include <time.h>            // clock_gettime()
 
 #include <lua5.3/lua.h>
 #include <lua5.3/lauxlib.h>
@@ -208,27 +217,32 @@ sem_t esem;
 // ----- Function definitions ----
 //================================
 
+/* defined in mockit.c */
+extern void timespec_add_ms__(struct timespec *ts, uint32_t ms);
+
 /*
  * Initialize the Lua library before it can be used.
  *
  * Initialization involves:
  * - initializing the unnamed semaphore `esem`.
  *
- * <-- return @lua
+ * <-- return 
  *     0 if successful, else the errno value set by sem_init(),
  *     if failed.
  */
-int lua_initialize(lua_State *L){
+int lua_initialize(void){
     int res = 0;
     res = sem_init(&esem, 0, 0);
-
+    if (res) return errno;
+    return 0;
+/*
     if (res == -1){
         lua_pushinteger(L, errno);
     }
     else{
         lua_pushinteger(L, 0);
     }
-
+*/
     return 1;
 }
 
@@ -260,19 +274,62 @@ int signal_event__(void){
  * The call made is of course blocking, and it unblocks 
  * as soon as the value of `esem` is > 0.
  *
+ * --> timeout
+ *     If timeout is 0, a call to sem_wait() is made to block
+ *     indefinitely waiting for a semaphore post on esem.
+ *     Otherwise if timeout > 0, it should be a timeout value
+ *     in milliseconds for how long to block waiting for a semaphore
+ *     post. A call to sem_timedwait() is made instead of sem_wait().
+ *
+ * <-- errnum
+ *     This is unused if timeout is 0. Otherwise if timeout > 0, calls are
+ *     made to various functions as explained next in the `return` section.
+ *     These functions set `errno`. If `errnum` is not NULL, `wait_for_event__`
+ *     will write to `errnum` the value of `errno` as set by any of the 
+ *     functions that failed. `errnum` can then be looked at in conjunction with
+ *     the value returned by `wait_for_event` to discern which function
+ *     set errno. If the value returned by `wait_for_event` is 0, errnum 
+ *     should be ignored.
+ *
  * <-- return
- *     0 on success, else the errno value set by sem_wait().
+ *     0 on success, else 1 if clock_gettime() failed, else 2 if
+ *     sem_timedwait() failed. If errnum is not NULL, the errno value set by 
+ *     clock_gettime() or sem_timedwait() is written there.
  */
-int wait_for_event__(void){
-    int res = 0;
-    res = sem_wait(&esem);
+int wait_for_event__(uint32_t timeout, int *errnum){
+    errno = 0;
 
-    if (res == -1){
-        return errno;
-    }
-    else{
+    if (!timeout){
+        // do not consider signal interrupts errors
+        if (sem_wait(&esem) == -1 &&  errno != EINTR){
+            if (errnum) *errnum = errno;
+            return 2;
+        }       
+
         return 0;
     }
+
+    // else timeout > 0
+    struct timespec timespec;
+    memset(&timespec, 0, sizeof(struct timespec));
+
+    if (clock_gettime(CLOCK_REALTIME, &timespec) == -1){
+        if (errnum) *errnum = errno;
+        return 1;
+    }
+
+    timespec_add_ms__(&timespec, timeout);
+
+    // do not consider timeouts or interrupts erros
+    if (sem_timedwait(&esem, &timespec) == -1 
+            && errno != ETIMEDOUT
+            && errno != EINTR)
+    {
+        if (errnum) *errnum = errno;
+        return 2;
+    }
+
+    return 0;
 }
 
 /* 
@@ -480,13 +537,28 @@ int lua_process_events(lua_State *L){
  * semaphore, which is incremented with every new event
  * generated.
  *
+ * --> timeout
+ *     an optional timeout value in milliseconds to block for. After TIMEOUT
+ *     milliseconds this function will return regardless of whether any new 
+ *     events have been added to the event queue or not.
+ *
  * <-- return @lua
  *     1 on failure (e.g. sem_wait() failed), 0 on success.
  */
 int lua_wait_for_events(lua_State *L){
-    lua_settop(L,0);
+    uint32_t timeout = 0;
 
-    if (wait_for_event__()){     // failed
+    // the timeout arg from lua is optional. See the comments on 
+    // wait_for_event__() for the semantics of this argument
+    lua_settop(L,1);
+    if (lua_type(L, 1) != LUA_TNIL){   // 1 argument, it must be an integer
+        luaL_checktype(L,1,LUA_TNUMBER); 
+        int res = 0;
+        timeout = lua_tointegerx(L, 1, &res);
+        if(!res) luaL_error(L,"failed to get timeout arg: must be an integer");
+    }
+
+    if (wait_for_event__(timeout, NULL)){     // failed
         lua_pushinteger(L, 1);
     }
     else{
@@ -554,7 +626,7 @@ int Mockit_get_interval_timer(lua_State *L){
 
     lua_Integer timeout = lua_tointegerx(L,1,&res);
     if(!res){
-        luaL_error(L,"failed to get timeout arg");
+        luaL_error(L,"failed to get timeout arg: must be an integer");
         return 1;
     }
 
@@ -639,7 +711,7 @@ int Mockit_register_oneoff_callback(lua_State *L){
 
     uint32_t timeout = (uint32_t) lua_tointegerx(L,1,&res);
     if(!res){
-        luaL_error(L,"failed to get interval value");
+        luaL_error(L,"failed to get interval value: must be an integer");
     }
 
     // see notes about Lua thread/state under Lua_get_interval_timer
@@ -749,7 +821,8 @@ int destroy_interval_timer(lua_State *L){
  *     so this value will always be 0.
  * 
  * <-- return 
- *     0 on sucess, an error number on error i.e. 0, 0 is returned on success.
+ *     0 on sucess, an error number on error i.e. a tuple of (error code, remaining)
+ *     is returned, which is (0,0) on success, and (errno, time_left) on error.
  */
 int luasleep(lua_State *L){
     int res = 0;
@@ -779,7 +852,7 @@ int luasleep(lua_State *L){
 
 /*
  * Return a time tuple of (seconds, milliseconds) on success
- * or a tuuple of (nil, error code) on failure.
+ * or a tuple of (nil, error code) on failure.
  *
  * The error code on failure is the value of errno set by
  * clock_gettime() (see the Mockit_gettime() comments in 
@@ -836,7 +909,6 @@ int get_mstimestamp(lua_State *L){
 
 /* Module functions */
 const struct luaL_Reg luamockit[] = {
-    {"init", lua_initialize},                   
     {"oneoff", Mockit_register_oneoff_callback},
     {"sleep", luasleep},
     {"time", get_time_tuple},
@@ -855,6 +927,7 @@ const struct luaL_Reg luamockit_metamethods[] = {
 
 /* Open/initialize module */
 int luaopen_luamockit(lua_State *L){
+    assert(lua_initialize() == 0);            // initialize semaphore etc
     luaL_newmetatable(L, MOCKIT_MT);
     lua_pushvalue(L,-1);
     lua_setfield(L,-2, "__index");            // the metatable's __index method should point to the metatable itself
