@@ -19,15 +19,38 @@
  */
 #define MAX_NS_VAL 999999999
 
-//===================================
-// ---- File-scoped globals --------
-//===================================
-
 /* Unused in this compilation unit */
 UNUSED(static pthread_mutex_t cbmtx) = PTHREAD_MUTEX_INITIALIZER;     // callback mutex
 
 
-static void keep_timer_straight(struct timespec *ts, uint32_t secs, uint32_t nanosecs){
+//===================================
+// ---- Function definitions  -------
+//===================================
+
+/* 
+ * Given a value in milliseconds, correctly populate the `struct timespec`
+ * provided with seconds and nanoseconds.
+ *
+ * The chalenges and difficulties of correctly populating the timespec
+ * structure is that while `.tv_nsec` is a long, its maximum acceptable
+ * value is in actuality much smaller than MAX_LONG. If one overshoots
+ * this accepted value, as described in e.g. the man page of `clock_nanosleep()`
+ * for example, EINVAL is normally returned. 
+ * 
+ * This function ensures that given a value in milliseconds, it is correctly 
+ * added to the seconds and nanoseconds values in the `struct timespec` 
+ * structure. 
+ *
+ * FMI see MAX_NS_VAL above and the comments below in the body of the function.
+ */
+//static void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
+void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
+
+    // convert ms to secs and ns
+    uint32_t  secs = milliseconds/ MS_IN_SECS; // 0 <= secs
+    uint32_t  msecs = milliseconds % MS_IN_SECS;
+    uint32_t  nsecs = msecs * NS_IN_MS; // time is given in ms but nanosleep expect ns
+
     (*ts).tv_sec += secs;
    
     /* the number of nanoseconds the way it's implemented in Mockit, will
@@ -35,7 +58,7 @@ static void keep_timer_straight(struct timespec *ts, uint32_t secs, uint32_t nan
        (see MAX_NS_VAL defined above for this purpose) which is 1 nanosecond 
        from a full second.
     */
-    assert(nanosecs < MAX_NS_VAL);
+    assert(nsecs < MAX_NS_VAL);
 
     /* If you go beyond MAX_NS_VAL, e.g. clock_nanosleep() WILL return an error.
        Therefore care must be taken we always stay within the range. If our value
@@ -43,25 +66,21 @@ static void keep_timer_straight(struct timespec *ts, uint32_t secs, uint32_t nan
        tv_sec, and only leave the remainder in tv_nsec.
     */
     long ns_free_space = MAX_NS_VAL - (*ts).tv_nsec;
-    // there's enough space to accomodate nanosecs
-    if (ns_free_space >= nanosecs){
-        (*ts).tv_nsec += nanosecs;    
+    // there's enough space to accomodate nsecs
+    if (ns_free_space >= nsecs){
+        (*ts).tv_nsec += nsecs;    
     }
     // not enough space: chop off the full second(s)
     else{
-        nanosecs += (*ts).tv_nsec;
-        uint32_t num_secs = nanosecs / NS_IN_SECS; 
+        nsecs += (*ts).tv_nsec;
+        uint32_t num_secs = nsecs / NS_IN_SECS; 
         (*ts).tv_sec += num_secs;
         
-        nanosecs = nanosecs % NS_IN_SECS;
-        assert(nanosecs <= MAX_NS_VAL);
-        (*ts).tv_nsec = nanosecs;
+        nsecs = nsecs % NS_IN_SECS;
+        assert(nsecs <= MAX_NS_VAL);
+        (*ts).tv_nsec = nsecs;
     }
 }
-
-//===================================
-// ---- Function definitions  -------
-//===================================
 
 /*
  * Make a blocking call to clock_nanosleep to sleep for TIME milliseconds. 
@@ -115,14 +134,9 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
         return -1;
     }
 
-    // convert ms to secs and ns
-    uint32_t  secs = milliseconds/ MS_IN_SECS; // 0 <= secs
-    uint32_t  msecs = milliseconds % MS_IN_SECS;
-    uint32_t  nsecs = msecs * NS_IN_MS; // time is given in ms but nanosleep expect ns
-
     // populate the struct timespect correctly, ensuring we stay within the
     // correct range for tv_nsec
-    keep_timer_straight(&to_sleep, secs, nsecs);
+    timespec_add_ms__(&to_sleep, milliseconds);
 
     // 1)
     // do resume sleep when interrupted by signals => time_left unused
