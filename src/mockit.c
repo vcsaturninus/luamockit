@@ -43,8 +43,8 @@ UNUSED(static pthread_mutex_t cbmtx) = PTHREAD_MUTEX_INITIALIZER;     // callbac
  *
  * FMI see MAX_NS_VAL above and the comments below in the body of the function.
  */
-//static void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
 void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
+    assert(ts);
 
     // convert ms to secs and ns
     uint32_t  secs = milliseconds/ MS_IN_SECS; // 0 <= secs
@@ -97,11 +97,15 @@ void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
  *     save the remaining time (if any) in 'time_left' on any interruption
  *     and return.
  * 
- * --> time_left 
+ * --> time_left, [optional]
  *     Time left (in milliseconds) until sleep woud've been completed. 
  *     0 if the sleep has been successfully completed. If do_restart
  *     is true, the sleep always completes and therefore time_left
- *     is always 0 in that case.
+ *     is always 0 in that case and so the parameter is ignored by 
+ *     this function and should likewise be ignored by the caller and
+ *     can be safely specified as NULL.
+ *     More generally, time_left is an optional parameter and the caller
+ *     can always specify it as NULL if they are uninterested in the info.
  *     
  * <-- return
  *     error code returned by clock_nanosleep() (0 on success).
@@ -130,7 +134,7 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
     memset(&to_sleep, 0, sizeof(struct timespec));
 
     if (clock_gettime(CLOCK_REALTIME, &to_sleep) == -1){
-        *time_left = milliseconds;  // have not slept at all
+        if (time_left) *time_left = milliseconds;  // have not slept at all
         return -1;
     }
 
@@ -154,7 +158,7 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
             else{
                 printf("res received: %i\n", res);
                 //printf("res received: %i\n", EINVAL);
-                *time_left = milliseconds;
+                if (time_left) *time_left = milliseconds;
             }
         }
     }
@@ -172,7 +176,7 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
             int32_t ms = 0;
             ms += rem.tv_sec * MS_IN_SECS;
             ms += rem.tv_nsec / NS_IN_MS;
-            *time_left = ms;
+            if (time_left) *time_left = ms;
         }
     }
     return res;  // 0 on success, otherwise clock_nanosleep() errror code
