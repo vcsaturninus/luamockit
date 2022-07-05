@@ -19,7 +19,9 @@ CWD:=$(shell pwd)
 OUT_DIR:=$(CWD)/out
 SRC_DIR:=$(CWD)/src
 TESTS_DIR:=$(CWD)/tests/
-TESTS_FILE:=tests.lua
+LUA_TESTS_FILE:=tests.lua
+C_TESTS_FILE:=tests.c
+C_TESTS_BIN:=ctests
 
 MOCKIT_SOURCES:=$(SRC_DIR)/mockit.c
 LUA_MOCKIT_SOURCES:=$(SRC_DIR)/luamockit.c
@@ -33,34 +35,51 @@ LUALIB_SONAME:=lua$(CLIB_SONAME)
 all : clean make_dirs build_clib build_lualib tests done
 
 build_clib: $(MOCKIT_SOURCES)
-	@echo "[ ] Building C library (mockit.so) ..."
+	@ echo "[ ] Building C library (mockit.so) ..."
 	@ $(CC) $^ -shared -fPIC $(CFLAGS) $(CPPFLAGS) $(LD_FLAGS) \
 		-o $(OUT_DIR)/$(CLIB_SONAME)
-	@echo ""
+	@ echo ""
 
 build_lualib: $(MOCKIT_SOURCES) $(LUA_MOCKIT_SOURCES)
-	@echo "[ ] Building lua library (luamockit.so) ..."
+	@ echo "[ ] Building lua library (luamockit.so) ..."
 	@ $(CC) $^ -shared -fPIC $(CFLAGS) $(CPPFLAGS) $(LD_FLAGS) \
 		-o $(OUT_DIR)/$(LUALIB_SONAME)
-	@echo ""
+	@ echo ""
 
 done :
-	@echo "[ ] DONE."
-	@echo ""
+	@ echo "[ ] DONE."
+	@ echo ""
 
 make_dirs:
-	@echo "[ ] Creating directories ... "
+	@ echo "[ ] Creating directories ... "
 	@ mkdir -p $(OUT_DIR)
-	@echo ""
+	@ echo ""
 
 clean:
-	@echo "[ ] Cleaning artifacts ... "
+	@ echo "[ ] Cleaning artifacts ... "
 	@ rm -rf $(OUT_DIR) 
-	@echo ""
+	@ echo ""
 
-.PHONY : tests
+.PHONY : tests ctests luatests
 
-tests:
-	@echo "[ ] Running tests ..."
-	@$(TESTS_DIR)/$(TESTS_FILE)
+tests: ctests luatests
 
+ctests: make_dirs build_clib
+	@ echo "[ ] Running C tests (mockit)..."
+	@ $(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -c $(TESTS_DIR)/$(C_TESTS_FILE) -o $(OUT_DIR)/$(C_TESTS_BIN).o
+	@ $(CC) $(CFLAGS) $(CPPFLAGS) -Isrc $(OUT_DIR)/$(C_TESTS_BIN).o -L$(OUT_DIR) -l:mockit.so -o out/$(C_TESTS_BIN)
+	@ LD_LIBRARY_PATH=$(realpath $(OUT_DIR)/):$(LD_LIBRARY_PATH) $(OUT_DIR)/$(C_TESTS_BIN)
+	@ echo ""
+
+luatests: make_dirs build_lualib
+	@ echo "[ ] Running lua tests (luamockit)..."
+	@ $(TESTS_DIR)/$(LUA_TESTS_FILE)
+	@ echo ""
+
+VALGRIND_REPORT:=valgrind.txt
+grind:
+	LD_LIBRARY_PATH=$(realpath $(OUT_DIR)/):$(LD_LIBRARY_PATH) \
+	valgrind --leak-check=full --show-leak-kinds=all \
+		--track-origins=yes --verbose \
+		--log-file=$(VALGRIND_REPORT) \
+		$(OUT_DIR)/$(C_TESTS_BIN)
