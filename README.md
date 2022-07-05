@@ -169,7 +169,4 @@ t2 = nil
 
 
 ## TODOs
- * write automatic C tests as well. This is particularly important so
-   we can run Valgrind and easily see if there are any memory leaks of 
-   significance.
-
+    * increase fixed-width int type used from 32 to 64 bits
