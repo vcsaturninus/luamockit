@@ -35,6 +35,8 @@
 #include <time.h>
 #include <stdint.h>
 
+#include "queue.h"
+
 // suppress warning about variable being declared but not used
 #if defined(__GNUC__)
 # define UNUSED(x) x __attribute__((unused))
@@ -62,8 +64,10 @@
 struct data{
     pthread_t  thread_id__;  // thread_id for sleeper thread created for each one-shot timer; populated by lib function
     bool       is_cyclic__;  // flag to mark interval timers: only call timer_delete on timer_id if this is true (else segfaults)
-    timer_t    timer_id__ ;
-
+    bool mfd;          // marked for death
+    bool enqueued;     // added to timerq 
+    bool free_data;    // whether to free the whole struct data when destroying
+    bool free_ctx;     // whether to free dt->ctx when destroying
     // for arbitrary use by the caller; e.g. an int here could be an index in the lua registry e.g. to a lua callback 
     int refs[INT_REF_COUNT];        
     uint32_t timeout;        // number of milliseconds before (one-off or interval) callback gets called 
@@ -86,15 +90,24 @@ void Mockit_static_data_init(
                              struct data *dt, 
                              void (*cb)(void *),
                              uint32_t timeout, 
-                             void *stuff
+                             void *stuff,
+                             bool free_data,
+                             bool free_ctx
                              );
 
 struct data *Mockit_dynamic_data_init(
                                       void (*cb)(void *), 
                                       uint32_t timeout, 
-                                      void *stuff
+                                      void *stuff,
+                                      bool free_data,
+                                      bool free_ctx
                                       );
 
 int Mockit_destroy(struct data *dt, bool free_data, bool free_ctx);
+
+int Mockit_init(void);
+
+int Mockit_disarm(pthread_t thread_id);
+
 
 #endif

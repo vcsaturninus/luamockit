@@ -6,10 +6,13 @@
 #include <assert.h> 
 #include <stdlib.h>      // free()
 #include <signal.h>      // union sigval
-#include <limits.h>
 #include <stdio.h>
 
 #include "mockit.h"
+#include "morre.h"
+#include "queue.h"
+
+int Mockit_timerq_delete(pthread_t thread_id);
 
 /*
  * Weirdly, the `struct timespec` passed to clock_nanosleep() stores
@@ -21,6 +24,21 @@
 
 /* Unused in this compilation unit */
 UNUSED(static pthread_mutex_t cbmtx) = PTHREAD_MUTEX_INITIALIZER;     // callback mutex
+
+//===================================
+// ---- Type definitions -------
+//===================================
+
+/* A callback timer suitable for adding to the timer object queue */
+typedef struct qi cbtimer_t;
+
+/* callback function */
+typedef void (* timedcb)(void *);
+
+//===================================
+// ---- File-scoped Variables -------
+//===================================
+struct queue timerq;
 
 
 //===================================
@@ -197,14 +215,61 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
  *     NULL is always returned. The function simply has this signature
  *     because it's required by PTHREADS for thread-starting functions.
  */
-static void *sleeper__(void *ctx){
+
+static void *oneshot__(void *ctx){
+    /* 
+     * one-off timers sleep ONCE for dt->timeout time
+     * then call dt->cb and then self-destruct.
+     */
     struct data *dt = ctx;  
-
-    //int res = Mockit_bsleep(dt->timeout, true, &remaining);
     assert(Mockit_bsleep(dt->timeout, true, NULL) == 0);
+    dt->cb(dt);
+    Mockit_destroy(dt, dt->free_data ? true : false, dt->free_ctx ? true : false);
 
-    // on sleep completion, call the callback
-    dt->cb(ctx);
+    return NULL;
+}
+
+/*
+ * interval timers first 1) add themselves to timerq, then 2) sleep for for dt->timeout, 
+ * then 3) call dt->cb, then 4) IFF the timer has been mfd, they self-destruct, otherwise
+ * they go back to 2).
+ */
+static void *cycle__(void *ctx){
+    struct data *dt = ctx;  
+    printf("timer with id %lu\n", dt->thread_id__);
+
+    if (!dt->enqueued && !dt->mfd){
+        int res = qi_enqueue(&timerq, dt, false);
+        dt->enqueued = true;
+        printf("res is %i\n", res);
+        if (res) exit(EXIT_FAILURE);
+    }
+
+    int mfd = 0;
+    uint32_t interval = dt->timeout;
+    timedcb callback = dt->cb;
+   
+while (!mfd){
+    assert(Mockit_bsleep(interval, true, NULL) == 0);
+
+    assert(!pthread_mutex_lock(&timerq.mtx));
+    mfd = dt->mfd;
+    assert(!pthread_mutex_unlock(&timerq.mtx));
+
+    if (mfd) break;
+    callback(dt);
+
+    assert(!pthread_mutex_lock(&timerq.mtx));
+    assert(dt);
+    mfd = dt->mfd;
+    assert(!pthread_mutex_unlock(&timerq.mtx));
+}
+    puts("got marked for death: will delete and destroy");
+    // otherwise, the timer has been marked for death,
+    // so free its resources, and dequeue it
+    Mockit_timerq_delete(dt->thread_id__);
+
+    Mockit_destroy(dt, dt->free_data ? true : false, dt->free_ctx ? true : false);
 
     return NULL;
 }
@@ -239,27 +304,12 @@ int Mockit_oneoff(uint32_t time, struct data *data){
     // use default thread attributes.
     data->timeout = time;
     data->is_cyclic__ = false;   // one-off, not cyclical
+    data->mfd  = false;  // not marked for death
 
-    if(pthread_create(&data->thread_id__, NULL, sleeper__, data)) return 1;
+    if(pthread_create(&data->thread_id__, NULL, oneshot__, data)) return 1;
     if (pthread_detach(data->thread_id__)) return 1;
     
     return 0;
-}
-
-/*
- * Run on interval expiry of timers created via Mockit_getit()
- * as a thread start routine.
- * 
- * --> sv
- *     sv.sival_ptr can hold arbitrary data: in this particular
- *     case, it will always be a `struct data *` (see mockit.h for 
- *     the definition of this structure). This function will cast 
- *     sv.sival_ptr to a `struct data *` and then call the cb() 
- *     stored there.
- */
-static void threadf(union sigval sv){
-    struct data *dt = sv.sival_ptr;
-    dt->cb(dt);
 }
 
 /*
@@ -293,37 +343,20 @@ static void threadf(union sigval sv){
  * just how POSIX interval timers behave.
  */
 int Mockit_getit(uint32_t interval, struct data *data){
-    assert(data);
+    if (!data) return -1;   // data should've been allocated and partly populated by caller
+
+    // create a thread that will start life by calling sleeper__; this
+    // will sleep for TIME duration before calling data->cb() with
+    // 'data' as an argument; the thread will store its id in thread_id and will 
+    // use default thread attributes.
+    data->timeout = interval;
     data->is_cyclic__ = true; 
+    data->mfd  = false;  // not marked for death
 
-    struct sigevent sev;         // used to specify notification via signal or thread for interval timers
-    struct itimerspec timerspec; // the actual timer object
-
-    uint32_t  secs, msecs, nsecs;
-    secs = interval / MS_IN_SECS;
-    msecs = interval % MS_IN_SECS;
-    nsecs = msecs * NS_IN_MS;
-
-    timerspec.it_value.tv_sec = secs;
-    timerspec.it_value.tv_nsec = nsecs;   // first expire interval*FACTOR ns from now
-    timerspec.it_interval.tv_sec = secs;  // keep expiring every INTERVAL seconds
-    timerspec.it_interval.tv_nsec = nsecs;
-
-    sev.sigev_notify = SIGEV_THREAD;       // notify via thread
-    sev.sigev_notify_function = threadf;   // on each timer expiration call this function as if it were a thread entry function
-    sev.sigev_notify_attributes = NULL;    // use default attributes
-    sev.sigev_value.sival_ptr = data;      // call threadf() with data as param
+    if(pthread_create(&data->thread_id__, NULL, cycle__, data)) return 1;
+    if (pthread_detach(data->thread_id__)) return 1;
     
-    if(timer_create(CLOCK_REALTIME, &sev, &(data->timer_id__)) == -1){
-        return errno;
-    }
-
-    // ARM the timer based on the settings in timerspec, and save timer id
-    if (timer_settime(data->timer_id__, 0, &timerspec, NULL) == -1){ 
-        return errno;
-    }
-    
-    return 0; // success
+    return 0;
 }
 
 /*
@@ -348,25 +381,31 @@ int Mockit_getit(uint32_t interval, struct data *data){
  *
  * <-- return
  *     errno value set by timer_delete().
+ *
+ * Subtleties
+ * ------------------------------
+ * after timer_delete() returns, there is a warranty that no new 
+ * notifications will happen, but there could be any number of 
+ * notification still being processed in their own thread.
+ * This means there's a distinct risk that if you free dt
+ * in this function, the pending threads that will STILL
+ * call the callback could execute dt->cb() on the freed
+ * dt, therefore performing an illegal read (use after free)
+ * by using a dangling pointer.
  */
 int Mockit_destroy(struct data *dt, bool free_data, bool free_ctx){
     assert(dt);
-
-    // for one-off timers the dt->timer_id will be invalid, since it was never set.
-    if (dt->is_cyclic__){  // interval timer, not one-shot timer
-        if (timer_delete(dt->timer_id__) == -1){
-            return errno;
-        }
-    }
     
+    printf("called with free_data=%i, free_ctx= %i\n", free_data, free_ctx);
+    // for one-off timers the dt->timer_id will be invalid, since it was never set.
     if (free_ctx) free(dt->ctx);
 
     if (free_data){
         free(dt);
     }
-    else{
-        memset(dt, 0, sizeof(struct data));
-    }
+    //else{
+    //    memset(dt, 0, sizeof(struct data));
+    //}
     return 0;
 }
 
@@ -394,7 +433,9 @@ int Mockit_destroy(struct data *dt, bool free_data, bool free_ctx){
  */
 struct data *Mockit_dynamic_data_init(void (*cb)(void *), 
                                       uint32_t timeout, 
-                                      void *ctx)
+                                      void *ctx,
+                                      bool free_data,
+                                      bool free_ctx)
 {
     struct data *dt = calloc(1,sizeof(struct data));
     assert(dt);
@@ -403,6 +444,8 @@ struct data *Mockit_dynamic_data_init(void (*cb)(void *),
     dt->cb = cb;
     dt->timeout = timeout;
     dt->ctx = ctx;
+    dt->free_ctx = free_ctx;
+    dt->free_data = free_data;
 
     return dt;
 }
@@ -415,7 +458,9 @@ struct data *Mockit_dynamic_data_init(void (*cb)(void *),
 void Mockit_static_data_init(struct data *dt, 
                                      void (*cb)(void *),
                                      uint32_t timeout, 
-                                     void *ctx)
+                                     void *ctx,
+                                     bool free_data,
+                                     bool free_ctx)
 {
     assert(dt);
     assert(cb);
@@ -425,6 +470,8 @@ void Mockit_static_data_init(struct data *dt,
     dt->cb = cb;
     dt->timeout = timeout;
     dt->ctx = ctx;
+    dt->free_ctx = free_ctx;
+    dt->free_data = free_data;
 }
 
 /*
@@ -482,4 +529,80 @@ int Mockit_mstimestamp(uint64_t *timestamp){
 
     return 0;
 }
+
+int Mockit_init(void){
+    int res = queue_init(&timerq, false, true);
+    printf("queue->initalized=%i\n", timerq.initialized);
+    return res;
+}
+
+/*
+ * Mark for death the timer with thread_id in the timerq.
+ */
+int Mockit_disarm(pthread_t thread_id){
+    int res = 1;
+    if (!(timerq.initialized & MTX_INITIALIZED)) return 1;
+    assert(!pthread_mutex_lock(&timerq.mtx));
+    
+    cbtimer_t *current = NULL;
+    printf("looking to disarm thread if %lu\n", thread_id);
+    for (current = timerq.head; current; current = current->next){
+        struct data *timer = current->data;
+        if (timer->thread_id__ == thread_id){
+            puts(".. and found it");
+            timer->mfd = true;
+            res = 0;
+        }
+    }
+
+    assert(!pthread_mutex_unlock(&timerq.mtx));
+    return res;
+}
+
+/*
+ * Mark for death the timer with thread_id in the timerq.
+ */
+int Mockit_timerq_delete(pthread_t thread_id){
+    if (!(timerq.initialized & MTX_INITIALIZED)) return 1;
+    assert(!pthread_mutex_lock(&timerq.mtx));
+
+    printf("looking to delete timer id %lu\n", thread_id);
+    if (queue_isempty(&timerq)) goto unlock;
+   
+    cbtimer_t *tmp = timerq.head;
+    struct data *data = tmp->data;
+
+    if (timerq.head == timerq.tail && data->thread_id__ == thread_id){ // one node only
+        printf("... and deleting timer\n");
+        timerq.head = timerq.tail = timerq.tail->next; //set head and tail to NULL
+        free(tmp);
+    }
+    else{ // multiple nodes in the queue
+        cbtimer_t *prev = tmp;
+        tmp = tmp->next;
+
+        for(;tmp; prev = tmp, tmp = tmp->next){
+            data = tmp->data; 
+
+            if (data->thread_id__ == thread_id){
+                printf("deleting time2r");
+                prev->next = tmp->next; 
+                free(tmp);
+
+                // if left with single node
+                if (!timerq.head->next){
+                    timerq.tail = timerq.head;
+                }
+
+                break;
+            }
+        }
+    }
+
+unlock: 
+    assert(!pthread_mutex_unlock(&timerq.mtx));
+    return 0;
+}
+
+
 

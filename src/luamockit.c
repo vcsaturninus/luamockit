@@ -156,12 +156,7 @@
 #include <lua5.3/lualib.h>
 
 #include "mockit.h"
-
-/* Error constants */
-#ifndef __MORRE_H
-#   define MORRE_MEM_ALLOC    7
-#   define MORRE_MUTEX        8
-#endif
+#include "queue.h"
 
 // the index in the Lua registry where the Lua callback is stored
 // that must be called for a particular timer expiration;
@@ -174,7 +169,7 @@
 
 
 //================================
-// ----- Struct definitions ------
+// ----- Type definitions ------
 //================================
 
 /* 
@@ -186,32 +181,18 @@
  * contains a callback. Dequeing and 'handling' the event means removing
  * it from the event queue and calling its callback function.
  */
-struct event{
-    void *data;
-    struct event *next;
-};
-
-/*
- * 'events' (dynamically allocated `struct event` types) get put here. 
- * An event is added when created, and removed when handled.
- */
-struct event_queue{
-    struct event *head, *tail;
-};
+typedef struct qi event_t;
 
 
 //================================
 // ------ File-scoped vars -------
 //================================
 
-static struct event_queue equeue = {.head = NULL, .tail = NULL};
-
-// used to synchronize enqueueing and dequeueing operations
-static pthread_mutex_t qmtx = PTHREAD_MUTEX_INITIALIZER;
-
-// event semaphore used to signal the addition of a new event to the queue
-sem_t esem;
-
+/*
+ * 'events' (dynamically allocated `struct event` types) get put in this
+ * 'event' queue. An event is added when created, and removed when handled.
+ */
+static struct queue equeue = {.head = NULL, .tail = NULL};
 
 //================================
 // ----- Function definitions ----
@@ -227,23 +208,16 @@ extern void timespec_add_ms__(struct timespec *ts, uint32_t ms);
  * - initializing the unnamed semaphore `esem`.
  *
  * <-- return 
- *     0 if successful, else the errno value set by sem_init(),
- *     if failed.
+ *     0 if successful, else the errno value set by one of the
+ *     functions called by queue_init: sem_init, if queue_init
+ *     returns 1; pthread_mutex_init, if queue_init return 2.
  */
 int lua_initialize(void){
-    int res = 0;
-    res = sem_init(&esem, 0, 0);
-    if (res) return errno;
+    errno = 0;
+
+    if (queue_init(&equeue, true, true)) return errno;
+    if (Mockit_init()) return errno;
     return 0;
-/*
-    if (res == -1){
-        lua_pushinteger(L, errno);
-    }
-    else{
-        lua_pushinteger(L, 0);
-    }
-*/
-    return 1;
 }
 
 /*
@@ -254,7 +228,7 @@ int lua_initialize(void){
  *
  * <-- return
  *     0 on success, else the errno value set by sem_post() on failure.
- */
+/
 int signal_event__(void){
     int res = 0;
     
@@ -265,6 +239,7 @@ int signal_event__(void){
 
     return 0;
 }
+*/
 
 /*
  * Wait for a new event to be added to the event queue.
@@ -296,12 +271,12 @@ int signal_event__(void){
  *     sem_timedwait() failed. If errnum is not NULL, the errno value set by 
  *     clock_gettime() or sem_timedwait() is written there.
  */
-int wait_for_event__(uint32_t timeout, int *errnum){
+int wait_for_event__(struct queue *equeue, uint32_t timeout, int *errnum){
     errno = 0;
 
     if (!timeout){
         // do not consider signal interrupts errors
-        if (sem_wait(&esem) == -1 &&  errno != EINTR){
+        if (sem_wait(&equeue->sem) == -1 &&  errno != EINTR){
             if (errnum) *errnum = errno;
             return 2;
         }       
@@ -321,7 +296,7 @@ int wait_for_event__(uint32_t timeout, int *errnum){
     timespec_add_ms__(&timespec, timeout);
 
     // do not consider timeouts or interrupts erros
-    if (sem_timedwait(&esem, &timespec) == -1 
+    if (sem_timedwait(&equeue->sem, &timespec) == -1 
             && errno != ETIMEDOUT
             && errno != EINTR)
     {
@@ -330,140 +305,6 @@ int wait_for_event__(uint32_t timeout, int *errnum){
     }
 
     return 0;
-}
-
-/* 
- * Create and initialize event struct for insertion into event queue.
- *
- * <-- return
- *     Dynamically-allocated and initialized `struct event` object.
- *     The object is initialized by having its memory zeroed out
- *     courtesy of calloc().
- */
-static struct event *event_create__(void){
-    struct event *ev = calloc(1, sizeof(struct event));
-    if (!ev){
-        fprintf(stderr, "Memory allocation failure: failed to mallocate struct event *\n");
-        exit(MORRE_MEM_ALLOC);
-    }
-
-    return ev;
-}
-
-/*
- * Destroy (free) a `struct event` object.
- * 
- * --> ev
- *     A dynamically-allocated `struct event *`.
- *
- *  NOTES
- * -------
- * ev->data is free()'d separately by lua_process_events()
- * right before this function is called. 
- */
-static void event_destroy__(struct event *ev){
-    free(ev);
-}
-
-/* 
- * Add an event struct to the event queue at the tail end.
- * 
- * --> queue
- *     the event queue that EVENT is to be added to.
- *
- * --> event
- *     the event to add to the event queue QUEUE.
- */
-static void event_enqueue__(struct event_queue *queue, struct event *event){
-    assert(queue && event);
-
-    if (!queue->head){        // list empty : insert new node as both tail and head
-        queue->head = event;
-        queue->tail = event;
-    }
-    else{                     // queue not empty; make event the new queue tail
-        queue->tail->next = event;
-        queue->tail = event;
-    }
-}
-
-/*
- * Dequeue event object from the head end of the event queue.
- * 
- * Remove an event from the event queue QUEUE
- * and return it. It's then the responsibility of
- * the caller to call event_destroy() on the value
- * returned by this function when no longer needed.
- *
- * --> queue
- *     the event queue to dequeue an item from (or NULL when empty).
- * 
- * <-- return 
- *     a dynamically allocated `struct event *` (NULL if the queue
- *     is empty).
- */
-static struct event *event_dequeue__(struct event_queue *queue){
-    assert(queue);
-    struct event *res = NULL;
-
-    if (!queue->head){    // queue empty
-        return NULL;
-    }
-
-    res = queue->head;    // not empty
-    queue->head = res->next;
-
-    if(!queue->head){     // queue empty NOW
-        queue->tail = NULL;
-    }
-
-    return res;
-}
-
-/*
- * Create an event object and add it to the event queue. 
- * 
- * @threadsafe
- *
- * <-- return
- *     Always return NULL. This is to conform to the signature
- *     expected of a pthread-starting function, which returns `void *`.
- *     This function will be called as a thread-entry function by one of
- *     the mockit library functions.
- */
-static void add_event_to_queue__(void *arg){
-    struct event *ev = event_create__();
-    ev->data = arg;
-
-    if (pthread_mutex_lock(&qmtx)) exit(MORRE_MUTEX);
-
-    event_enqueue__(&equeue, ev);
-    if (signal_event__()) fprintf(stderr, "%s\n", "failed to post event");
-
-    if(pthread_mutex_unlock(&qmtx)) exit(MORRE_MUTEX);
-
-    //return NULL;
-}
-
-/*
- * Remove and return event object from the event queue.
- *
- * @threadsafe
- *
- * <-- return
- *     a dynamically allocated `struct event *` (or NULL if 
- *     the quueue is empty). It's the responsibility of the caller 
- *     to call event_destroy() on this when no longer needed so as
- *     to free the associated memory.
- */
-static struct event *get_event_from_queue__(void){
-    struct event *ev = NULL;
-    
-    if (pthread_mutex_lock(&qmtx)) exit(MORRE_MUTEX);
-    ev = event_dequeue__(&equeue);
-    if (pthread_mutex_unlock(&qmtx)) exit(MORRE_MUTEX);
-
-    return ev;
 }
 
 /*
@@ -487,14 +328,14 @@ static struct event *get_event_from_queue__(void){
  *     the number of events handles is returned otherwise.
  */
 int lua_process_events(lua_State *L){
-    struct event *event = NULL;
+    event_t *event = NULL;
     struct data *data   = NULL;
     lua_Integer num_handled = 0;
 
     // lua callback must take no arguments : discard everything
     lua_settop(L,0);
 
-    while ((event = get_event_from_queue__())){
+    while ((event = qi_dequeue(&equeue))){
         data = event->data;
         lua_State *Lstate = data->ctx;
 
@@ -520,7 +361,7 @@ int lua_process_events(lua_State *L){
             luaL_unref(Lstate, LUA_REGISTRYINDEX, data->refs[LUA_CB_IDX_IN_LUA_REGISTRY]); 
             luaL_unref(Lstate, LUA_REGISTRYINDEX, data->refs[LUA_STATE_IDX_IN_LUA_REGISTRY]); 
             free(data);
-            event_destroy__(event);
+            qi_destroy(event, false);
         }
 
         ++num_handled;
@@ -558,7 +399,7 @@ int lua_wait_for_events(lua_State *L){
         if(!res) luaL_error(L,"failed to get timeout arg: must be an integer");
     }
 
-    if (wait_for_event__(timeout, NULL)){     // failed
+    if (wait_for_event__(&equeue, timeout, NULL)){     // failed
         lua_pushinteger(L, 1);
     }
     else{
@@ -566,6 +407,10 @@ int lua_wait_for_events(lua_State *L){
     }
 
     return 1;
+}
+
+static inline void add_event_to_queue__(void *data){
+    qi_enqueue(&equeue, data, true);
 }
 
 /*
@@ -656,6 +501,8 @@ int Mockit_get_interval_timer(lua_State *L){
     dt->ctx = L; // used to pass the lua_State to callback
     dt->timeout = (uint32_t) timeout;
     dt->cb = add_event_to_queue__;
+    dt->free_ctx = false;
+    dt->free_data = false;
 
     if((res = Mockit_getit(dt->timeout, dt))){
         luaL_error(L,"failed to set up interval timer: %s", strerror(res));
@@ -727,12 +574,14 @@ int Mockit_register_oneoff_callback(lua_State *L){
     }
     
     // allocate and initialize a data object that the callback will be called with
-    struct data *dt = Mockit_dynamic_data_init(add_event_to_queue__, timeout, L);
+    struct data *dt = Mockit_dynamic_data_init(add_event_to_queue__, timeout, L, false, false);
     if (!dt){
         luaL_error(L,"Failed to allocate memory for data struct");
     }
-    dt->refs[LUA_CB_IDX_IN_LUA_REGISTRY]   = lua_callback_ref;// unique lua registry ref to callback
-    dt->refs[LUA_STATE_IDX_IN_LUA_REGISTRY]= lua_state_ref;   // unique lua registry ref to lua state/thread for anchoring
+    dt->refs[LUA_CB_IDX_IN_LUA_REGISTRY]    = lua_callback_ref;// unique lua registry ref to callback
+    dt->refs[LUA_STATE_IDX_IN_LUA_REGISTRY] = lua_state_ref;   // unique lua registry ref to lua state/thread for anchoring
+    dt->free_data = false;
+    dt->free_ctx = false;
 
     // the sleep happens in a different thread so that the library isn't blocked and 
     // can deal with the registration of more timers and callbacks; this means we get a 
@@ -797,12 +646,11 @@ int destroy_interval_timer(lua_State *L){
     // simply destroy the timer id instead and return nil 
     // so as to remove any reference to this (see comments above) and 
     // then Lua will garbage collect the memory
-    if (timer_delete(dt->timer_id__)){  // -1 on failure, 0 on success
-        luaL_error(L, "failed to destroy interval timer: invalid timer id provided");
-    }
-
-    lua_pushnil(L); // the result of this function should be assigned back to the timer object
-    return 1;
+    int res = Mockit_disarm(dt->thread_id__);  
+    printf("resss is %i\n", res);
+    //lua_pushnil(L); // the result of this function should be assigned back to the timer object
+    //return 1;
+    return 0;
 }
 
 /*
