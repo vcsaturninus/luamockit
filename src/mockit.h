@@ -35,8 +35,6 @@
 #include <time.h>
 #include <stdint.h>
 
-#include "queue.h"
-
 // suppress warning about variable being declared but not used
 #if defined(__GNUC__)
 # define UNUSED(x) x __attribute__((unused))
@@ -55,17 +53,23 @@
 #define MS_IN_SECS 1000         // 10^3
 #define NS_IN_MS   1000000      // 10^6
 
-#define INT_REF_COUNT 3         // number of int references that a `struct data`'s `refs` array member holds.
+// number of int references that a `struct data`'s `refs` array member holds.
+#define INT_REF_COUNT 3 
+
+// The CLOCK type to use with clock_naonosleep(), clock_gettime() etc 
+//#define MOCKIT_CLOCK_ID    CLOCK_MONOTONIC_RAW
+//#define MOCKIT_CLOCK_ID    CLOCK_MONOTONIC
+#define MOCKIT_CLOCK_ID    CLOCK_BOOTTIME
 
 
 /* __ -postfixed members are set by the library functions and should not 
  * be touched by the user.
  */
 struct data{
+    pthread_mutex_t mtx__;
     pthread_t  thread_id__;  // thread_id for sleeper thread created for each one-shot timer; populated by lib function
     bool       is_cyclic__;  // flag to mark interval timers: only call timer_delete on timer_id if this is true (else segfaults)
-    bool mfd;          // marked for death
-    bool enqueued;     // added to timerq 
+    char mark;         // used to comunicate the destruction state
     bool free_data;    // whether to free the whole struct data when destroying
     bool free_ctx;     // whether to free dt->ctx when destroying
     // for arbitrary use by the caller; e.g. an int here could be an index in the lua registry e.g. to a lua callback 
@@ -105,9 +109,8 @@ struct data *Mockit_dynamic_data_init(
 
 int Mockit_destroy(struct data *dt, bool free_data, bool free_ctx);
 
-int Mockit_init(void);
-
-int Mockit_disarm(pthread_t thread_id);
-
+void Mockit_disarm(struct data *data);
+bool Mockit_hasmod(char mark);
+bool Mockit_ismfd(char mark);
 
 #endif

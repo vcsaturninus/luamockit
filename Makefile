@@ -34,15 +34,19 @@ LUALIB_SONAME:=lua$(CLIB_SONAME)
 # always clean first
 all : clean make_dirs build_clib build_lualib tests done
 
+mockit: clean make_dirs build_clib
+
+luamockit: clean make_dirs build_lualib
+
 build_clib: $(MOCKIT_SOURCES)
 	@ echo "[ ] Building C library (mockit.so) ..."
-	@ $(CC) $^ -shared -fPIC $(CFLAGS) $(CPPFLAGS) $(LD_FLAGS) \
+	@ $(CC) $^ -shared -fPIC $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) \
 		-o $(OUT_DIR)/$(CLIB_SONAME)
 	@ echo ""
 
 build_lualib: $(MOCKIT_SOURCES) $(LUA_MOCKIT_SOURCES)
 	@ echo "[ ] Building lua library (luamockit.so) ..."
-	@ $(CC) $^ -shared -fPIC $(CFLAGS) $(CPPFLAGS) $(LD_FLAGS) \
+	@ $(CC) $^ -shared -fPIC $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) \
 		-o $(OUT_DIR)/$(LUALIB_SONAME)
 	@ echo ""
 
@@ -66,8 +70,7 @@ tests: ctests luatests
 
 ctests: make_dirs build_clib
 	@ echo "[ ] Running C tests (mockit)..."
-	@ $(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -c $(TESTS_DIR)/$(C_TESTS_FILE) -o $(OUT_DIR)/$(C_TESTS_BIN).o
-	@ $(CC) $(CFLAGS) $(CPPFLAGS) -Isrc $(OUT_DIR)/$(C_TESTS_BIN).o -L$(OUT_DIR) -l:mockit.so -o out/$(C_TESTS_BIN)
+	@ $(CC) $(CFLAGS) $(CPPFLAGS) -Isrc $(TESTS_DIR)/$(C_TESTS_FILE) -L$(OUT_DIR) -l:mockit.so -o out/$(C_TESTS_BIN)
 	@ LD_LIBRARY_PATH=$(realpath $(OUT_DIR)/):$(LD_LIBRARY_PATH) $(OUT_DIR)/$(C_TESTS_BIN)
 	@ echo ""
 
@@ -83,3 +86,5 @@ grind:
 		--track-origins=yes --verbose \
 		--log-file=$(VALGRIND_REPORT) \
 		$(OUT_DIR)/$(C_TESTS_BIN)
+		#$(TESTS_DIR)/$(LUA_TESTS_FILE)
+		#$(OUT_DIR)/$(C_TESTS_BIN)

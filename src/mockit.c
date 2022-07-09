@@ -10,17 +10,46 @@
 
 #include "mockit.h"
 #include "morre.h"
-#include "queue.h"
-
-int Mockit_timerq_delete(pthread_t thread_id);
 
 /*
  * Weirdly, the `struct timespec` passed to clock_nanosleep() stores
  * the nanoseconds (tv_nsec) in a long. However, clock_nanosleep() says it will 
  * return EINVAL if the the tv_nsec value it gets passed is > 999999999, which is 
- * in actuality MUCH less than MAX_LONG.
+ * in actuality MUCH less than MAX_LONG. So MAX_LONG cannot be used to check
+ * that the tv_nsec Mockit has set is within range and a new constant is needed.
  */
 #define MAX_NS_VAL 999999999
+
+/*
+ * When Mockit_disarm() is called, MOCKIT_MFD ('marked for destruction')
+ * is set into data->mark. When the thread responsible for the interval
+ * timer notices this (which it checks on every interval expiration),
+ * it will acknowledge it by setting MOCKIT_MOD ('mark of destruction')
+ * into data->mark. After setting this, the thread exits and discontinues
+ * the timer i.e. the associated callback no longer gets called as a result
+ * of this particular timer (though it may be called as a result of other
+ * timers if it's so registered). 
+ *
+ * This mechanism is needed if the thread is not in charge of freeing memory: 
+ * when the caller disarms a timer, it can then check if the thread has acknowledged 
+ * the disarming before actually freeing the memory. If the caller does not wait
+ * for the acknowledgement then the thread is likely to commit 'use after free'
+ * by dereferencing the now freed mockit object (struct data), leading to memory
+ * corruption or a crash. 
+ * Converesely, if the thread IS in charge of freeing the memory, then once the 
+ * caller has set MFD (by calling Mockit_disarm()), it should NOT wait for 
+ * an acknowledgement: the thread may have already freed the mockit object 
+ * (struct data) so the caller is in this scenario at risk of committing 
+ * 'use after free' itself! Any reference to the mockit object should be set to NULL
+ * by the caller and no longer used to access that timer.
+ *
+ * The calls to Mockit_disarm() and Mockit_mod() always succeed (with the notes
+ * mentioned above).
+ *
+ * See the comments on Mockit_disarm() and Mockit_mod() fmi.
+ */
+#define MOCKIT_MFD   0x1
+#define MOCKIT_MOD   0x2
 
 /* Unused in this compilation unit */
 UNUSED(static pthread_mutex_t cbmtx) = PTHREAD_MUTEX_INITIALIZER;     // callback mutex
@@ -34,12 +63,6 @@ typedef struct qi cbtimer_t;
 
 /* callback function */
 typedef void (* timedcb)(void *);
-
-//===================================
-// ---- File-scoped Variables -------
-//===================================
-struct queue timerq;
-
 
 //===================================
 // ---- Function definitions  -------
@@ -68,6 +91,9 @@ void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
     uint32_t  secs = milliseconds/ MS_IN_SECS; // 0 <= secs
     uint32_t  msecs = milliseconds % MS_IN_SECS;
     uint32_t  nsecs = msecs * NS_IN_MS; // time is given in ms but nanosleep expect ns
+    
+    //fprintf(stderr, "milliseconds=%i, sec=%i, msecs=%i, nsecs=%i\n", milliseconds, secs, msecs, nsecs);
+    //fprintf(stderr, "got tv_sec=%li, tv_nsec=%li\n", (*ts).tv_sec, (*ts).tv_nsec);
 
     (*ts).tv_sec += secs;
    
@@ -98,6 +124,7 @@ void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
         assert(nsecs <= MAX_NS_VAL);
         (*ts).tv_nsec = nsecs;
     }
+    //fprintf(stderr, "returning from timespec_add_ms__\n");
 }
 
 /*
@@ -126,7 +153,9 @@ void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
  *     can always specify it as NULL if they are uninterested in the info.
  *     
  * <-- return
- *     error code returned by clock_nanosleep() (0 on success).
+ *     0 on sucess; 
+ *     1 if clock_gettime() failed, else the error code returned by 
+ *     clock_nanosleep().
  *
  * NOTES
  * --------
@@ -151,9 +180,9 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
     struct timespec to_sleep; // current time + milliseconds
     memset(&to_sleep, 0, sizeof(struct timespec));
 
-    if (clock_gettime(CLOCK_REALTIME, &to_sleep) == -1){
+    if (clock_gettime(MOCKIT_CLOCK_ID, &to_sleep) == -1){
         if (time_left) *time_left = milliseconds;  // have not slept at all
-        return -1;
+        return 1;
     }
 
     // populate the struct timespect correctly, ensuring we stay within the
@@ -164,18 +193,18 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
     // do resume sleep when interrupted by signals => time_left unused
     if (do_restart){
         // rem is not used when TIMER_ABSTIME is used
-        res = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &to_sleep, NULL);
+        res = clock_nanosleep(MOCKIT_CLOCK_ID, TIMER_ABSTIME, &to_sleep, NULL);
+        //printf("clock nanosleep returned res=%i\n", res);
+        //printf("ENOTSUP is %i\n", ENOTSUP);
 
         if (res){
             if (res == EINTR){
                 while (res == EINTR){
-                    res = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &to_sleep, NULL);
+                    res = clock_nanosleep(MOCKIT_CLOCK_ID, TIMER_ABSTIME, &to_sleep, NULL);
                 }
             }
 
             else{
-                printf("res received: %i\n", res);
-                //printf("res received: %i\n", EINVAL);
                 if (time_left) *time_left = milliseconds;
             }
         }
@@ -188,7 +217,7 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
         struct timespec rem;
         memset(&rem, 0, sizeof(rem));
 
-        res = clock_nanosleep(CLOCK_REALTIME, 0, &to_sleep, &rem);
+        res = clock_nanosleep(MOCKIT_CLOCK_ID, 0, &to_sleep, &rem);
 
         if (res == EINTR){
             int32_t ms = 0;
@@ -223,6 +252,9 @@ static void *oneshot__(void *ctx){
      */
     struct data *dt = ctx;  
     assert(Mockit_bsleep(dt->timeout, true, NULL) == 0);
+    dt->mark |= MOCKIT_MOD;  /* set mark of destruction */
+    fprintf(stderr, "setting MOD\n");
+    fprintf(stderr, "mark is now %i, mark & MOD = %i\n", dt->mark, dt->mark & MOCKIT_MOD);
     dt->cb(dt);
     Mockit_destroy(dt, dt->free_data ? true : false, dt->free_ctx ? true : false);
 
@@ -236,39 +268,41 @@ static void *oneshot__(void *ctx){
  */
 static void *cycle__(void *ctx){
     struct data *dt = ctx;  
-    printf("timer with id %lu\n", dt->thread_id__);
-
-    if (!dt->enqueued && !dt->mfd){
-        int res = qi_enqueue(&timerq, dt, false);
-        dt->enqueued = true;
-        printf("res is %i\n", res);
-        if (res) exit(EXIT_FAILURE);
-    }
-
-    int mfd = 0;
+    bool mfd = false;
     uint32_t interval = dt->timeout;
     timedcb callback = dt->cb;
-   
+
+/* No locking is needed when checking mfd because 
+ * the thread never sets it, only checks it. If the 
+ * caller sets it at any point, it will be caught either
+ * on this or the next loop. The thread then acknolwedged
+ * that by setting MOD. Simiarly no locking is required,
+ * because the thread only sets it and the caller only ever
+ * checks it. Further, the caller only sets MFD ONCE
+ * and the thread ONLY sets MOD IFF MFD has been set. 
+ * By definition therefore these cannot be performed at
+ * the same time and there's therefore no race condition
+ * that must be protected against.
+ */
 while (!mfd){
     assert(Mockit_bsleep(interval, true, NULL) == 0);
-
-    assert(!pthread_mutex_lock(&timerq.mtx));
-    mfd = dt->mfd;
-    assert(!pthread_mutex_unlock(&timerq.mtx));
-
-    if (mfd) break;
     callback(dt);
 
-    assert(!pthread_mutex_lock(&timerq.mtx));
-    assert(dt);
-    mfd = dt->mfd;
-    assert(!pthread_mutex_unlock(&timerq.mtx));
+    mfd = dt->mark & MOCKIT_MFD;
 }
-    puts("got marked for death: will delete and destroy");
-    // otherwise, the timer has been marked for death,
-    // so free its resources, and dequeue it
-    Mockit_timerq_delete(dt->thread_id__);
+    //puts("got marked for death: will delete and destroy");
+    // otherwise, timer has been marked for destruction;
+    // acknowledge this by setting the 'mark of destruction',
+    // (MOCKIT_MOD) and free the memory if responsible.
+    fprintf(stderr, "setting MOD\n");
+    dt->mark |= MOCKIT_MOD;  /* set mark of destruction */
+    fprintf(stderr, "mark is now %i, mark & MOD = %i\n", dt->mark, dt->mark & MOCKIT_MOD);
+    assert(Mockit_bsleep(interval, true, NULL) == 0);
+    callback(dt);
 
+    // clearly, the caller can and should only check the MOD
+    // IFF the thread is NOT responsible for freeing the resources i.e.
+    // this function does NOT free data.
     Mockit_destroy(dt, dt->free_data ? true : false, dt->free_ctx ? true : false);
 
     return NULL;
@@ -304,8 +338,7 @@ int Mockit_oneoff(uint32_t time, struct data *data){
     // use default thread attributes.
     data->timeout = time;
     data->is_cyclic__ = false;   // one-off, not cyclical
-    data->mfd  = false;  // not marked for death
-
+    data->mark = 0;
     if(pthread_create(&data->thread_id__, NULL, oneshot__, data)) return 1;
     if (pthread_detach(data->thread_id__)) return 1;
     
@@ -343,7 +376,7 @@ int Mockit_oneoff(uint32_t time, struct data *data){
  * just how POSIX interval timers behave.
  */
 int Mockit_getit(uint32_t interval, struct data *data){
-    if (!data) return -1;   // data should've been allocated and partly populated by caller
+    assert(data); // should've been allocated by the caller
 
     // create a thread that will start life by calling sleeper__; this
     // will sleep for TIME duration before calling data->cb() with
@@ -351,10 +384,13 @@ int Mockit_getit(uint32_t interval, struct data *data){
     // use default thread attributes.
     data->timeout = interval;
     data->is_cyclic__ = true; 
-    data->mfd  = false;  // not marked for death
+    data->mark = 0;  // not marked for deletion
 
-    if(pthread_create(&data->thread_id__, NULL, cycle__, data)) return 1;
-    if (pthread_detach(data->thread_id__)) return 1;
+    if(pthread_create(&data->thread_id__, NULL, cycle__, data)
+        || pthread_detach(data->thread_id__))
+    {
+        return 1;
+    }
     
     return 0;
 }
@@ -396,7 +432,7 @@ int Mockit_getit(uint32_t interval, struct data *data){
 int Mockit_destroy(struct data *dt, bool free_data, bool free_ctx){
     assert(dt);
     
-    printf("called with free_data=%i, free_ctx= %i\n", free_data, free_ctx);
+    //printf("called with free_data=%i, free_ctx= %i\n", free_data, free_ctx);
     // for one-off timers the dt->timer_id will be invalid, since it was never set.
     if (free_ctx) free(dt->ctx);
 
@@ -484,7 +520,8 @@ void Mockit_static_data_init(struct data *dt,
  *     millieseconds since the last second.
  *
  * <-- return
- *     0 on success, the value of errno on error.
+ *     0 on success, the value of errno on error as set
+ *     by clock_gettime()
  *
  * Note that either or both of secs and ms can be NULL.
  * If both are NULL, the call is essentially useless as no time
@@ -530,79 +567,38 @@ int Mockit_mstimestamp(uint64_t *timestamp){
     return 0;
 }
 
-int Mockit_init(void){
-    int res = queue_init(&timerq, false, true);
-    printf("queue->initalized=%i\n", timerq.initialized);
-    return res;
-}
-
 /*
- * Mark for death the timer with thread_id in the timerq.
+ * Mark for destruction the timer with thread_id in the timerq.
+ *
+ * If the caller is responsible for freeing struct data (the mockit
+ * object) i.e. `Mockit_{static,dynamic}_data_init()` was NOT called
+ * with free_data=true and free_ctx=true, it should wait until 
+ * the thread responsible for the interval timer has acknowledged this,
+ * which can be checked with Mockit_mod(). Only then is it safe for the
+ * caller to call Mockit_destroy() on the `struct data *` (mockit object).
+ *
+ * Otherwise if the caller is not responsible for freeing this data, it should
+ * consider the mockit object desotroyed and no longer use it for anything
+ * (e.g. it's illegal to derefence it, call Mockit_mod() on it etc.) once it's
+ * called Mockit_disarm().
+ *
+ * FMI, see the notes at the top where MOCKIT_MOD and MOCKIT_MFD are defined.
  */
-int Mockit_disarm(pthread_t thread_id){
-    int res = 1;
-    if (!(timerq.initialized & MTX_INITIALIZED)) return 1;
-    assert(!pthread_mutex_lock(&timerq.mtx));
-    
-    cbtimer_t *current = NULL;
-    printf("looking to disarm thread if %lu\n", thread_id);
-    for (current = timerq.head; current; current = current->next){
-        struct data *timer = current->data;
-        if (timer->thread_id__ == thread_id){
-            puts(".. and found it");
-            timer->mfd = true;
-            res = 0;
-        }
-    }
-
-    assert(!pthread_mutex_unlock(&timerq.mtx));
-    return res;
+void Mockit_disarm(struct data *data){
+    //assert(!pthread_mutex_lock(&data->mtx__));
+    data->mark |= MOCKIT_MFD;
+    //assert(!pthread_mutex_unlock(&data->mtx__));
 }
 
-/*
- * Mark for death the timer with thread_id in the timerq.
- */
-int Mockit_timerq_delete(pthread_t thread_id){
-    if (!(timerq.initialized & MTX_INITIALIZED)) return 1;
-    assert(!pthread_mutex_lock(&timerq.mtx));
-
-    printf("looking to delete timer id %lu\n", thread_id);
-    if (queue_isempty(&timerq)) goto unlock;
-   
-    cbtimer_t *tmp = timerq.head;
-    struct data *data = tmp->data;
-
-    if (timerq.head == timerq.tail && data->thread_id__ == thread_id){ // one node only
-        printf("... and deleting timer\n");
-        timerq.head = timerq.tail = timerq.tail->next; //set head and tail to NULL
-        free(tmp);
-    }
-    else{ // multiple nodes in the queue
-        cbtimer_t *prev = tmp;
-        tmp = tmp->next;
-
-        for(;tmp; prev = tmp, tmp = tmp->next){
-            data = tmp->data; 
-
-            if (data->thread_id__ == thread_id){
-                printf("deleting time2r");
-                prev->next = tmp->next; 
-                free(tmp);
-
-                // if left with single node
-                if (!timerq.head->next){
-                    timerq.tail = timerq.head;
-                }
-
-                break;
-            }
-        }
-    }
-
-unlock: 
-    assert(!pthread_mutex_unlock(&timerq.mtx));
-    return 0;
+bool Mockit_hasmod(char mark){
+    //assert(!pthread_mutex_lock(&data->mtx__));
+    return true ? (mark & MOCKIT_MOD) : false;
+    //assert(!pthread_mutex_unlock(&data->mtx__));
 }
 
-
+bool Mockit_ismfd(char mark){
+    //assert(!pthread_mutex_lock(&data->mtx__));
+    return true ? (mark & MOCKIT_MFD) : false;
+    //assert(!pthread_mutex_unlock(&data->mtx__));
+}
 
