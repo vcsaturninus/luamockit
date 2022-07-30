@@ -34,6 +34,13 @@ extern void timespec_add_ms__(struct timespec *timespec, uint32_t ms);
 // conditional printf
 #define reveal(fmt, ...) if (getenv("DEBUG_MODE")) fprintf(stderr, fmt, ##__VA_ARGS__);
 
+int data_destructor(void *ctx){
+    free(ctx);
+    puts("in destructor, freed data");
+
+    return 0;
+}
+
 
 /* Ascertain that Mockit's mstimestamp feature works 
    correctly. Return true on success, false on failure.
@@ -132,14 +139,14 @@ static void IntervalCallback(void *stuff){
    fails.
 */
 static bool test_oneoff_timer(uint64_t ms){
-    struct data dt;
-    Mockit_static_data_init(&dt, OneOffCallback, ms, NULL, false, true);
+    struct mockit mit;
+    Mockit_static_init(&mit, OneOffCallback, ms, false, NULL, false, NULL);
     
     uint64_t start = 0;
     assert(!Mockit_mstimestamp(&start));
     uint64_t expected = start+ms;
 
-    assert(!Mockit_oneoff(ms, &dt));
+    assert(!Mockit_arm(&mit));
     // sleep 1 second past the point where the timer should've expired,
     // to err on the side of caution
     assert(!Mockit_bsleep(ms+1000, true, NULL));
@@ -176,15 +183,16 @@ static bool test_oneoff_timer(uint64_t ms){
    Therefore we should allow for an error marging of 1.
 */
 static bool test_interval_timers(uint64_t duration, uint64_t interval){
-    struct data *dt = Mockit_dynamic_data_init(IntervalCallback, interval, NULL, true, true);
+    struct mockit *mit = Mockit_dynamic_init(IntervalCallback, interval, true, NULL, true, data_destructor);
     
     uint64_t start = 0;
     assert(!Mockit_mstimestamp(&start));
     uint64_t expected_total_calls = duration / interval;
 
-    assert(!Mockit_getit(interval, dt));
+    assert(!Mockit_arm(mit));
     assert(!Mockit_bsleep(duration, true, NULL));
-    Mockit_disarm(dt);
+    int rc = Mockit_destroy(mit, -1);
+    printf("rc = %i\n", rc);
     
     reveal("Interval callback was called %lu times. Expected: %lu+/-%i\n", post, expected_total_calls,ERROR_RANGE);
     if (!(expected_total_calls <= post+ERROR_RANGE && expected_total_calls >= post-ERROR_RANGE)){
@@ -203,14 +211,14 @@ int main(int argc, char **argv){
     puts("* * * (Any failure invalidates subsequent results) * * *");
 
     fprintf(stderr, " @ Ascertaining accuracy and precision of Mockit_mstimestamp()\n");
-    //run_test(test_mstimestamp, 2000);
+    run_test(test_mstimestamp, 2000);
     //run_test(test_mstimestamp, 1313);
     //run_test(test_mstimestamp, 17);
     //run_test(test_mstimestamp, 8);
     //run_test(test_mstimestamp, 1);
     //run_test(test_mstimestamp, 3771);
     //run_test(test_mstimestamp, 222);
-    run_test(test_mstimestamp, 66);
+    //run_test(test_mstimestamp, 66);
 
     fprintf(stderr, " @ Ascertaining accuracy and precision of Mockit_bsleep()\n");
     run_test(test_bsleep, 9);
@@ -243,7 +251,7 @@ int main(int argc, char **argv){
     run_test(test_interval_timers, 8000, 900);
     run_test(test_interval_timers, 103, 10);
 
-    sleep(2);
+    sleep(7);
     fprintf(stderr, "passed: %i of %i\n", tests_passed, tests_run);
     if (tests_passed != tests_run) exit(EXIT_FAILURE);
     exit(EXIT_SUCCESS);
