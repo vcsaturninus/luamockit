@@ -1,149 +1,3 @@
-/* ===================================================================================
-   * * * * * * * * * * * * DESIGN AND IMPLEMENTATION NOTES * * * * * * * * * * * * * * 
-   -----------------------------------------------------------------------------------
-   The design isn't the most intuitive one in the context of callbacks but is the
-   result of a process of having to adapt to what's possible and convenient to do with
-   Lua.
-
-   The problem can be summed up as follows: 
-   - One can't call back asynchronously into a Lua state; not without the risk of
-   corrupting the lua-C API stack associated with that state. 
-   
-   The above has a host of potential solutions but all of them fall somehow short
-   or prove inconvenient.
-
-   Saving lua states/threads
-   ----------------------------
-
-   If using coroutines, each one has its own lua thread, and a C function that gets
-   called might therefore be called with a lua_State other than the main one.
-   Instinctively, one would would think to save this state in a C data structure 
-   and then use it to call back into lua on a timer's expiry, when a registered
-   callback must be called. However, the state might've well disappeared by then - 
-   resulting in a crash.
-   To ensure the lua threads don't go anywhere and avoid the aforementioned issue,
-   they must be ANCHORED, either via assignment to a lua variable or by saving them
-   in the lua REGISTRY.
-   
-   USING A SINGLE GLOBAL STATE
-   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-   To do away with this nuisance, an alternative would be to save the state passed
-   to the first function that opens the library in a global variable to be used by
-   all the functions in the C library that call back into Lua. However, there's no
-   guarantee that this state is actually the main state of Lua -- again, if
-   coroutines are used.
-
-   The above two points are made to emphasize the following: 
-   -- coroutines can greatly complicate matters and are to be avoided.
-   This library is expected to be called from lua scripts with a single lua state.
-   
-   -- Unless passed the main lua thread/state (which is the case if there's a SINGLE
-   lua state/thread i.e. when coroutines aren't used), the state must be ANCHORED to
-   ensure it doesn't get garbage collected leading to a crash when a call back into it
-   happens.
-   This library will anchor the state the Mockit_get_interval_timer() and 
-   Mockit_register_oneoff_callback() functions get called with, and therefore CAN 
-   be used even from scripts employing coroutines, but the library can't promise correct 
-   behavior.
-
-   Asynchronously calling back into a Lua State
-   ----------------------------------------------
-
-   Even with the above points in mind, the main problem is that one CANNOT call back 
-   into a lua state asynchronously.
-
-   The first problem is, obviously, mutithreading. If mutithreading is being used,
-   like in this library, then multiple threads simultaneously interacting with the
-   same lua state will inevitably end badly. 
-
-   This problem has two solutions:
-
-   1) each POSIX thread can have its own lua State.
-   This has a whole host of disadvantages: each state is completely separate. The state,
-   which will be a whole new lua instance, must be opened, populated with the required
-   libraries etc -- which is slower. It's also very cumbersone to share variables
-   between two lua states, despite a number of libraries having been written specifically
-   to address this.
-
-
-   2) Mutexes must be used to serialize the POSIX threads' interaction with the lua state.
-   This avoids the inevitable race conditions.  
-
-   HOWEVER, 2) has another glaring problem: if multiple libraries are used and they all
-   take the same aproach, then chaos ensues.
-   Consider the case where another separate library uses the same approach: it saved
-   the lua state(s), and then uses mutexes to ensure a single POSIX thread calls
-   back into the state at a time. This library is almost certain to use different
-   mutexes than luamockit, and therefore even though each library has done away
-   with race conditions internally, the two libraries themselves are now engaged
-   in a race as they're bound to interfere with each other.
-
-   the Lua interpreter itself has global locks one can use, but it's not an option if
-   one wants or must use the standard lua version provided.
-
-   ------------------------------------------------------------------------------------
-   -------------------------------> EVENT QUEUE <--------------------------------------
-   ------------------------------------------------------------------------------------
-   The approach this library ultimately settled on is all about giving the power to lua
-   itself.
-   Interval and one-off timers generate an 'event' on expiration. The event is simply 
-   a structure that contains some internal details, primarily the lua callback associated
-   with this event that must be called back as a result of the timer having expired. 
-   This event gets added to a global event queue in this library.
-
-   * At no point is LUA called back asynchronously. *
-
-   The queue simply gets populated, from multiple threads (and therefore enqueing
-   and dequeing operations must be and are protected by a mutex to ensure serialization).
-
-   The lua script itself must periodically call the lua_process_events() function
-   which will go through the event queue and dequeue each pending event and 'handle' it.
-   To handle an event means to call the Lua callback associated with it, and then
-   remove it from the event queue.
-    
-   Therefore each call to lua_process_events() has a backlog that it needs to clear.
-   The rarer lua_process_events() gets called, the bigger the backlog and the less 
-   precise the timers. 
-
-   That is to say, if the user registers a callback to be called back every 3 seconds
-   but the lua_process_events gets called every 10 seconds, then the callback will
-   only get called every 10 seconds and every 10 seconds it will be called 3 times
-   in a row (because the timer for the callback will have expired 3 times)!
-
-   It's therefore important to call the lua_process_events() function as often as 
-   possible : or, specifically, about as frequently as the callback with the shortest
-   interval timer.
-
-   To solve the above problem another function is provided - `lua_wait_for_events()` - 
-   which makes a blocking call to wait on the list to be populated. It unblocks as
-   soon as an event is added to the list. Note that if there are events in the queue,
-   this function still blocks and will only unblock when a NEW event gets added.
-   It's therefore advisable that the user either calls this function before any events
-   get created (i.e. before setting up any timers) or after emptying the queue with
-   `lua_process_events()`. With the above in mind, a possible undesirable scenario
-   is that the function gets called after some events have already been generated
-   but without any new events being generated, with the result that the function
-   will block forever and the events end up never being handled. To account for this
-   possibility, `lua_wait()` takes an optional parameter, `timeout`. The blocking call
-   will unblock either as soon as a new event is generated or after timeout milliseconds
-   -- whichever comes first.
-   
-   Lua script design
-   --------------------
-
-   The above points mean that a certain design naturally imposes itself for a lua script
-   using the interval timers feature of this library (though this is by no means mandatory).
-   The script will most often take the form of an infinite loop that blocks with 
-   `lua_wait()` and then calls `lua_process_events()` every time it unblocks.
- 
-   This makes it most suited to scripts meant to be running as daemons. This might
-   not be as much of a problem as it sounds, since that's exactly the context where
-   one would typically even want to have callbacks called asynchronously or at certain 
-   intervals: event loops dispatching events.
-   ===================================================================================
- */
-
 #include <errno.h>
 #include <string.h>          // strerror()
 #include <assert.h>
@@ -155,59 +9,108 @@
 #include <lua5.3/lauxlib.h>
 #include <lua5.3/lualib.h>
 
+#define LUAMOCKIT
 #include "mockit.h"
 #include "morre.h"
 
-/*
- * the index in the Lua registry where the Lua callback is stored
- * that must be called for a particular timer expiration;
- * and the lua state associated with the callback and timers.
- */
-#define LUA_CB_REG_IDX       0
-#define LUA_STATE_REG_IDX    1
-#define LUA_USERDATA_REG_IDX 2
-
 /* metatable in Lua for interval timer object ('mockit');
- * exposed to lua code as a full userdata 
+ * exposed to lua code as a full userdata
  */
 #define MOCKIT_MT "mockit_mt__"
+
+/* Timeout value when waiting for a MOCKIT_MOD-marked event */
+#define LUAMOCKIT_MOD_WAIT_TIMEOUT 5000
+
+
+#ifdef DEBUG_MODE
+#   define say(...) say__(__VA_ARGS__)
+#else 
+#   define say(...) ; /* empty  statement */
+#endif
 
 
 /* ================================ *
  * ----- Struct definitions ------  *
  * ================================ */
 
-/* 
- * an event in this context is an entry in an event queue, associated 
- * with (and added as a result of the expiry of a) timer (either 
+/*
+ * an event in this context is an entry in an event queue, associated
+ * with (and added as a result of the expiry of a) timer (either
  * one-shot or an interval timer).
  *
- * Each event points to a `struct data`, which in turn, among others, 
- * contains a Lua callback. Dequeing and 'handling' the event means removing
- * it from the event queue and calling its callback function.S
+ * Each event points to a `struct mockit`, which among others,
+ * contains a pointer to a `struct luamockit`. This in turn has pointers
+ * to a Lua callback, the Lua state, and various references in the Lua
+ * Registry used for anchoring purposes. Dequeing and 'handling' the event
+ * means removing it from the event queue and calling its callback function.
  *
- * When an interval timer is disarmed, the thread in charge of it will set
- * a mark (MOD) in acknowledgement. Any event struct so marked (i.e. mod
- * is true) should be handled and then its data released with Mockit_destroy().
- * An event with ->mod set is the last event generated by that particular
- * timer and therefore its resources must be released.
- * 
+ * When an interval timer is disarmed, a mark is implicitly set (MOCKIT_MFD)
+ * in the struct representing the timer object. The thread in charge of the
+ * timer will set another mark (MOCKIT_MOD) in acknowledgement. Any event
+ * struct marked with MOCKIT_MFD is ignored: the associated Lua callback is
+ * NOT called anymore because the timer has been _disarmed_. However the
+ * resources associated with the timer cannot be released yet either: the timer
+ * _cannot_ self-destruct and clean up because there may be events in the queue
+ * holding references to those resources and therefore it's a distinct possibility
+ * use-after-free will be performed by the event queue processor, potentially leading
+ * to a crash. Conversely, a timer cannot be destroyed from the queue event processor
+ * at any given time because then the thread itself that's in charge of the  timer
+ * may perform use-after-free and/or generate new events that will need to be handled
+ * (and handling would be impossible since the Lua references etc will've been released
+ * by the event queue processor, as mentioned).
+ *
+ * The sensible and correct way of releasing the resources requires coordination.
+ * This is achieved through the 'marks' aforementioned. When the user wants to
+ * destroy a timer, first the timer gets 'disarmed', which implicitly sets the
+ * MOCKIT_MFD mark. The timer thread wil see this as soon as it wakes up and set
+ * MOCKIT_MOD in acknowledgement, then generate a last MOCKIT_MOD-marked event before
+ * definitely exitting. The event queue processor knows an event is essentially expired
+ * when it seen the MOCKIT_MFD mark set, so the event is accordinly ignored. The next
+ * event associated with the timer must be MOCKIT_MOD-marked, on receipt of which the
+ * event queue processor releases all resources (e.g. any dynamic memory _not_ owned by
+ * Lua, lua references etc) associated with the timer. At this point the timer is
+ * considered destroyed, so we can finally return to Lua (which has been blocking on
+ * the destroy call) safely.
+ *
  * Interval timers are therefore a stream made up of any number of unamarked
- * events terminated with marked event. A one-shot timer otoh always generates
- * a single marked event.
+ * events terminated with MOCKIT_MOD-marked event preceded by a MOCKIT_MFD-marked
+ * event. A one-shot timer otoh always generates a single MOCKIT_MOD-marked event.
+ * MOCKIT_MFD is never set for one-off timers because they never get disarmed.
+ *
+ * Note each event container/struct MUST have a copy of the mark of the timer AS 
+ * IT WAS AT THE TIME THE EVENT WAS GENERATED. This allows each event struct to be
+ * marked and examined independently as each would have its own copy of the mark.
+ * Conversely, it's perilous to use the timer mark only ince if changed at any point
+ * in time, since the timer object is being pointed to by every event struct, its 
+ * mark will be changed even in event structs that have already been generated.
+ * For example, setting MOCKIT_MOD would cause the fatal problem of multiple event
+ * structs now pointing to a timer object whose mark has MOD set. Having each event
+ * struct maintain its own copy of the mark avoids such thorny issues.
  */
 struct event{
     void *data;
     struct event *next;
-    char mark;   
+    uint8_t mark;  /* a copy of the timer object (carried in data) mark */
+    bool cyclic;   /* true if carrying a cyclic timer payload */
 };
 
 /*
- * 'events' (dynamically allocated `struct event` types) get put here. 
+ * 'events' (dynamically allocated `struct event` types) get put here.
  * An event is added when created, and removed when handled.
  */
 struct event_queue{
     struct event *head, *tail;
+    uint64_t count;   /* acual count */
+    uint64_t pending; /* only pending events, excluding ones that have a mark set */
+};
+
+/*
+ * Extends the timer object with attributes needed for Lua integration */
+struct luamockit{
+    int lua_state_ref; /* index in the Lua registry to Lua state reference */
+    int lua_cb_ref;    /* index in the Lua registry to a Lua callback */
+    int lua_udata_ref; /* index in the Lua registry to lua-allocated `struct mockit` */
+    void *lua_state;   /* pointer to the lua state to call back into; anchored via lua_state_ref */
 };
 
 
@@ -233,6 +136,43 @@ static sem_t esem;
 
 /* defined in mockit.c */
 extern void timespec_add_ms__(struct timespec *ts, uint32_t ms);
+extern uint8_t Mockit_setmod(uint8_t mark);
+
+/*
+ * Used to ensure that before the thread in charge of the timer exits
+ * a last MOCKIT_MOD-marked event is generated so that the event queue
+ * procesor knows to release all resources associated with the timer.
+ *
+ * The sensitive cleanup and resource release operations are left to the
+ * event queue processor.
+ */
+static int mockit_cthread_finalizer(void *mit){
+    assert(mit);
+    struct mockit *m = mit;
+    unsigned int mark = m->mark__ ;
+    m->mark__ = Mockit_setmod(m->mark__);
+    printf("finalizer : setting MOD for event with ival=%u, mit %p , lmit  %p; before - %u, after - %u\n", ((struct mockit*)mit)->timeout__, (void *)mit, (void *)m->ctx, mark, m->mark__);
+    m->cb(m);
+
+    return 0; /* success */
+}
+
+void remove_lua_refs(struct luamockit *lmit, bool cyclic){
+    assert(lmit);
+    lua_State *Lstate = lmit->lua_state;
+
+    // unref Lua callback and lua state from lua registry
+    // cyclic timers also have a reference in the Lua registry
+    // in order to keep the struct mockit anchored once the user has
+    // disarmed the full user data
+    // fprintf(stderr, "--> interval : removing reference to userdata , mit=, mark=\n");
+    luaL_unref(Lstate, LUA_REGISTRYINDEX, lmit->lua_cb_ref);
+    luaL_unref(Lstate, LUA_REGISTRYINDEX, lmit->lua_state_ref);
+
+    if (cyclic){
+        luaL_unref(Lstate, LUA_REGISTRYINDEX, lmit->lua_udata_ref);
+    }
+}
 
 /*
  * Initialize the Lua library before it can be used.
@@ -241,18 +181,18 @@ extern void timespec_add_ms__(struct timespec *ts, uint32_t ms);
  * - initializing the unnamed semaphore `esem`.
  * - initializing the event queue mutex `qmtx`.
  *
- * <-- return 
+ * <-- return
  *     0 if successful, else 1 if the semaphore
  *     could not be initialized, else 2 if the mutex
  *     could not be initialized. If errnum is not NULL,
  *     the value of errno is stored there as set by
  *     any failed function call (e.g. sem_init()). On
- *     success the value written into errnum should be
+ *     success any value written into errnum should be
  *     ignored.
  */
 int lua_initialize(int *errnum){
     errno = 0;
-    
+
     if (sem_init(&esem,0,0)){
         if (errnum) *errnum = errno;
         return 1;
@@ -262,22 +202,24 @@ int lua_initialize(int *errnum){
         if (errnum) *errnum = errno;
         return 2;
     }
-    
+
     errno = 0;
+    if (errnum) *errnum = 0;
+
     return 0;
 }
 
 /*
  * Increment the `esem` semphore to signal the creation of a new event.
  *
- * When a new 'event' is created, it's added to the event queue and the 
+ * When a new 'event' is created, it's added to the event queue and the
  * semaphore is incremented (posted).
  *
  * <-- return
  *     0 on success, else the errno value set by sem_post() on failure.
  */
 int signal_event__(void){
-    
+
     if (sem_post(&esem) == -1){
         return errno;
     }
@@ -288,9 +230,9 @@ int signal_event__(void){
 /*
  * Wait for a new event to be added to the event queue.
  *
- * This is done by making a call to decrement (wait) the 
+ * This is done by making a call to decrement (wait) the
  * `esem` semaphore that's posted by signal_event__().
- * The call made is of course blocking, and it unblocks 
+ * The call made is of course blocking, and it unblocks
  * as soon as the value of `esem` is > 0.
  *
  * --> timeout
@@ -304,19 +246,19 @@ int signal_event__(void){
  *     This is unused if timeout is 0. Otherwise if timeout > 0, calls are
  *     made to various functions as explained next in the `return` section.
  *     These functions set `errno`. If `errnum` is not NULL, `wait_for_event__()`
- *     will write to `errnum` the value of `errno` as set by any of the 
+ *     will write into `errnum` the value of `errno` as set by any of the
  *     functions that failed. `errnum` can then be looked at in conjunction with
  *     the value returned by `wait_for_event()` to discern which function
- *     set errno. If the value returned by `wait_for_event()` is 0 (success), 
+ *     set errno. If the value returned by `wait_for_event()` is 0 (success),
  *     errnum should be ignored.
  *
  * <-- return
  *     0 on success, else 1 if clock_gettime() failed, else 2 if
- *     sem_timedwait() failed. If errnum is not NULL, the errno value set by 
+ *     sem_timedwait() failed. If errnum is not NULL, the errno value set by
  *     clock_gettime() or sem_timedwait() is written there.
  */
 int wait_for_event__(uint32_t timeout, int *errnum){
-    errno = 0;  // reset value of errno
+    errno = 0;
     if (errnum) *errnum = 0;
 
     if (!timeout){
@@ -324,7 +266,7 @@ int wait_for_event__(uint32_t timeout, int *errnum){
         if (sem_wait(&esem) == -1 && errno != EINTR){
             if (errnum) *errnum = errno;
             return 2;
-        }       
+        }
 
         return 0;
     }
@@ -332,22 +274,20 @@ int wait_for_event__(uint32_t timeout, int *errnum){
     // else timeout > 0
     struct timespec timespec;
     memset(&timespec, 0, sizeof(struct timespec));
-    
-    /* MUST be realtime: sem timedwait expects epoch timestamp in abstime*/
+
+    /* MUST be realtime: sem_timedwait expects epoch timestamp in abstime*/
     if (clock_gettime(CLOCK_REALTIME, &timespec) == -1){
         if (errnum) *errnum = errno;
         return 1;
     }
-    
-    //fprintf(stderr, "timeout is %i\n", timeout);
-    //fprintf(stderr, "time before %li, %li\n", timespec.tv_sec, timespec.tv_nsec);
+
     timespec_add_ms__(&timespec, timeout);
-    //fprintf(stderr, "time after %li, %li\n", timespec.tv_sec, timespec.tv_nsec);
 
     // do not consider timeouts or interrupts erros
-    if (sem_timedwait(&esem, &timespec) == -1 
+    if (sem_timedwait(&esem, &timespec) == -1
             && errno != ETIMEDOUT
-            && errno != EINTR)
+            && errno != EINTR
+        )
     {
         if (errnum) *errnum = errno;
         return 2;
@@ -355,7 +295,7 @@ int wait_for_event__(uint32_t timeout, int *errnum){
     return 0;
 }
 
-/* 
+/*
  * Create and initialize event struct for insertion into event queue.
  *
  * <-- return
@@ -366,33 +306,33 @@ int wait_for_event__(uint32_t timeout, int *errnum){
  * This function always succeeds -- otherwise it exits the program.
  */
 static struct event *event_create__(void){
-    struct event *ev = calloc(1, sizeof(struct event));
+    void *ev = NULL;
+    ev = calloc(1, sizeof(struct event));
+    //printf("calloc returned ev=%p\n", ev);
+
     if (!ev){
-        fprintf(stderr, "Memory allocation failure: failed to mallocate struct event *\n");
+        fprintf(stderr, "Memory allocation failure: failed to mallocate event struct\n");
         exit(MORRE_MEM_ALLOC);
     }
 
-    return ev;
+    return (struct event *)ev;
 }
 
 /*
  * Destroy (free) a `struct event` object.
- * 
- * --> ev
- *     A dynamically-allocated `struct event *`.
  *
- *  NOTES
- * -------
- * ev->data is lua-managed memory so it cannot and 
+ * --> ev @dynamic
+ *
+ * NOTE: ev->data is lua-managed memory so it cannot and
  * must not be freed.
  */
-static void event_destroy__(struct event *ev){
+static inline void event_destroy__(struct event *ev){
     free(ev);
 }
 
-/* 
+/*
  * Add an event struct to the event queue at the tail end.
- * 
+ *
  * --> queue
  *     the event queue that EVENT is to be added to.
  *
@@ -410,20 +350,23 @@ static void event_enqueue__(struct event_queue *queue, struct event *event){
         queue->tail->next = event;
         queue->tail = event;
     }
+
+    queue->count++;
+    if (!Mockit_hasmod(event->mark) && !Mockit_ismfd(event->mark)) queue->pending++;
 }
 
 /*
  * Dequeue event object from the head end of the event queue.
- * 
- * Remove an event from the event queue QUEUE
- * and return it. It's then the responsibility of
- * the caller to call event_destroy() on the value
- * returned by this function when no longer needed.
+ *
+ * Remove an event from the event queue and return it.
+ * It's then the responsibility of the caller to call
+ * event_destroy() on the value returned by this function when
+ * no longer needed.
  *
  * --> queue
  *     the event queue to dequeue an item from (or NULL when empty).
- * 
- * <-- return 
+ *
+ * <-- return
  *     a dynamically allocated `struct event *` (NULL if the queue
  *     is empty).
  */
@@ -442,27 +385,35 @@ static struct event *event_dequeue__(struct event_queue *queue){
         queue->tail = NULL;
     }
 
+    queue->count--;
+    if (!Mockit_hasmod(res->mark) && !Mockit_ismfd(res->mark)) queue->pending--;
+
     return res;
 }
 
 /*
- * Create an event object and add it to the event queue. 
+ * Create an event object and add it to the event queue.
  *  -- thread-safe wrapper around event_enqueue__().
  *
  * @threadsafe
  *
  * <-- return
  *     returns nothing: in case of failure there is no convenient
- *     way to report any errors since this function gets called in a 
+ *     way to report any errors since this function gets called in a
  *     separate thread.
  */
 static void add_event_to_queue__(void *arg){
     struct event *ev = event_create__();
-    ev->data = arg;
-    ev->mark = ((struct data *)ev->data)->mark;
-    //fprintf(stderr, "ev->mark is %i when enqueing\n", ev->mark);
 
     if (pthread_mutex_lock(&qmtx)) exit(MORRE_MUTEX);
+
+    ev->data = arg;
+    ev->mark = ((struct mockit *)arg)->mark__;
+    ev->cyclic = ((struct mockit *)arg)->is_cyclic__ ? true : false;
+    struct mockit *mm = ev->data;
+    printf("-- CALLBACK: add_event_to_queue__: enqueueing event %p, cyclic=%i, mark=%u, mit=%p, ival=%u \n", (void *)ev, ev->cyclic, ev->mark, (void*)ev->data, mm->timeout__);
+
+    //fprintf(stderr, "ev->mark is %i when enqueing\n", ev->mark);
 
     event_enqueue__(&equeue, ev);
 
@@ -481,14 +432,14 @@ static void add_event_to_queue__(void *arg){
  * @threadsafe
  *
  * <-- return
- *     a dynamically allocated `struct event *` (or NULL if 
- *     the quueue is empty). It's the responsibility of the caller 
+ *     a dynamically allocated `struct event *` (or NULL if
+ *     the quueue is empty). It's the responsibility of the caller
  *     to call event_destroy() on this when no longer needed so as
  *     to free the associated memory.
  */
 static struct event *get_event_from_queue__(void){
     struct event *ev = NULL;
-    
+
     if (pthread_mutex_lock(&qmtx)) exit(MORRE_MUTEX);
     ev = event_dequeue__(&equeue);
     if (pthread_mutex_unlock(&qmtx)) exit(MORRE_MUTEX);
@@ -496,80 +447,93 @@ static struct event *get_event_from_queue__(void){
     return ev;
 }
 
+/* true if e == q.head, else false */
+static inline bool is_qhead(struct event_queue *q, struct event *e){
+    return q->head == e ? true : false;
+}
+
+/* true if e == q.tail, else false */
+static inline bool is_qtail(struct event_queue *q, struct event *e){
+    return q->tail == e ? true : false;
+}
+
 /*
- * Handle each event in the event queue.
+ * Event queue processor - handle each event in the event queue.
  *
  * This is the function that actually processes the 'events'
- * in the event queue. This is meant to be called from within LUA. 
- * The 'events' here are in essence just timer expirations, either 
+ * in the event queue. This is meant to be called from within Lua.
+ * The 'events' here are in essence just timer expirations, either
  * one-off or periodic. Each event object is a wrapper for some
- * data, including a reference into the lua registry to a lua callback 
- * function that must be called when the event is dequeued/ 'handled'. 
+ * data, including a reference into the lua registry to a lua callback
+ * function that must be called when the event is dequeued/ 'handled'.
  * The callback IS really the whole point of the 'event' in this library.
  * NOTE: the Lua callback function must take no params and return no values.
- * 
- * The way this gets called in LUA is typically after the `esem` semaphore
- * is posted in this library, which in turn unblocks the blocking call made 
+ *
+ * The way this gets called in Lua is typically after the `esem` semaphore
+ * is posted in this library, which in turn unblocks the blocking call made
  * from within Lua to wait for events (`luamockit_wait()`).
  *
  * <-- return @Lua
- *     An error is thrown in Lua in case of failure; 
+ *     An error is thrown in Lua in case of failure;
  *     the number of events handled is returned otherwise.
  */
 int lua_process_events(lua_State *L){
     struct event *event = NULL;
-    struct data *data   = NULL;
+    struct mockit *mit = NULL;
     lua_Integer num_handled = 0;
-    
-    //fprintf(stderr, "in lua processs events\n");
+
     // lua callback must take no arguments : discard everything
     lua_settop(L,0);
-    
+
     while ((event = get_event_from_queue__())){
         //fprintf(stderr, "event->mark is %i\n", event->mark);
-        data = event->data;
-        if (Mockit_ismfd(event->mark) && !Mockit_hasmod(event->mark)){
-            fprintf(stderr, "mark (%i) has mfd, skipping\n", event->mark);
-            event_destroy__(event);
-            continue;
-        }
-        lua_State *Lstate = data->ctx;
-
-        lua_rawgeti(Lstate, LUA_REGISTRYINDEX, data->refs[LUA_CB_REG_IDX]);
+        mit = event->data;
+        struct luamockit *lmit = mit->ctx;
+        lua_State *Lstate = lmit->lua_state;
+        printf("handling event=%p mockit=%p with lmit=%p, mark=%u, cyclic=%i, ival=%u\n", (void *)event, (void *)mit, (void *)lmit, event->mark, event->cyclic, mit->timeout__);
+ 
+        lua_rawgeti(Lstate, LUA_REGISTRYINDEX, lmit->lua_cb_ref);
+        // printf("cb ref is %i, lmit = %p\n", lmit->lua_cb_ref, (void *)lmit);
         if (!lua_isfunction(Lstate, 1)){
-            luaL_error(Lstate, "failed to retrieve callback from Lua registry");
+            //luaL_error(Lstate, "failed to retrieve callback from Lua registry");
         }
-        // lua callback function must take no params and return no values
-        lua_pcall(Lstate, 0, 0, 0);
 
-        // data should ONLY be deallocated if the current event is NOT
-        // the result (of the expiration) of an interval timer; that's 
-        // because in the case of interval timers, a userdata object is 
-        // returned to lua that represents that interval timer, when created.
-        // This would have to be manually and explicitly deallocated by 
-        // removing all references from lua and by calling the destroy() metamethod. 
-        // Lua takes care of all of that (you actually CANNOT call free() on 
-        // Lua-managed userdata).
-        // One-off timers otoh (the only other possible type of event here) do not
-        // return a userdata upon creation and so they must be deallocated here
-        if (Mockit_hasmod(event->mark)){
-            fprintf(stderr, "@@ HAS MOD MARK SET, CLEANING UP\n");
-            // unref Lua callback and luastate from lua registry
-            luaL_unref(Lstate, LUA_REGISTRYINDEX, data->refs[LUA_CB_REG_IDX]); 
-            luaL_unref(Lstate, LUA_REGISTRYINDEX, data->refs[LUA_STATE_REG_IDX]);
-            /* cyclic timers also have a lightuserdata reference in the registry
-               in order to keep the struct data anchored once the user has 
-               disarmed the full user data
-            */
-            if (data->is_cyclic__){
-                fprintf(stderr, "--> interval : removing reference to userdata\n");
-                luaL_unref(Lstate, LUA_REGISTRYINDEX, data->refs[LUA_USERDATA_REG_IDX]);
+        /* one-off timers generate a single event => handle then release resources */
+        if (!event->cyclic){
+            fprintf(stderr, "--> one-shot: freeing data\n");
+
+            // lua callback function must take no params and return no values
+            lua_pcall(Lstate, 0, 0, 0);
+            remove_lua_refs(lmit, false);
+
+            free(lmit);
+            free(mit);
+        }
+
+        else if(event->cyclic){
+            if (!Mockit_ismfd(event->mark) && !Mockit_hasmod(event->mark)){
+                lua_pcall(Lstate, 0, 0, 0);
             }
-            if (!data->is_cyclic__){
-                fprintf(stderr, "--> one-shot: freeing data\n");
-                free(data);
+
+            /* interval timer MOCKIT_MFD-marked event: skip it; this precedes
+             * a last MOCKIT_MOD-marked interval timer event */
+            else if ( Mockit_ismfd(event->mark) && !Mockit_hasmod(event->mark)){
+                fprintf(stderr, "mark (%i) has mfd, skipping\n", event->mark);
+                event_destroy__(event);
+                continue;  /* do not count as 'handled' */
+            }
+       
+            else if (Mockit_hasmod(event->mark)){
+                // interval timers are lua-managed userdata: cannot call free on them.
+                // one-off timers otoh must be deallocated here.
+                fprintf(stderr, "@@ HAS MOD MARK SET, CLEANING UP\n");
+                remove_lua_refs(lmit, true);
+                free(lmit);
+                event_destroy__(event);
+                continue; /* do not count as 'handled' */
             }
         }
+
         event_destroy__(event);
 
         ++num_handled;
@@ -580,15 +544,32 @@ int lua_process_events(lua_State *L){
 }
 
 /*
+ * Return the count of pending events in the event queue.
+ *
+ * <-- int @lua
+ *     count of events in the event queue waiting to be handled.
+ */
+int get_pending_events_count(lua_State *L){
+    lua_settop(L, 0); // no args
+    
+    /* race condition, but it's inconsequential. We're interested 
+     * in the number of events in equeue at the time of checking. */
+    lua_pushinteger(L, equeue.count);
+
+    return 1;
+}
+
+/*
  * Block until an event is posted to the event queue.
  *
  * The blocking call is achieved by WAITING on the `esem`
  * semaphore, which is incremented with every new event
- * generated.
+ * generated. If there are already events in the queue,
+ * this call returns immediately.
  *
  * --> timeout
  *     an optional timeout value in milliseconds to block for. After TIMEOUT
- *     milliseconds this function will return regardless of whether any new 
+ *     milliseconds this function will return regardless of whether any new
  *     events have been added to the event queue or not.
  *
  * <-- return @lua
@@ -600,61 +581,63 @@ int lua_wait_for_events(lua_State *L){
     uint32_t timeout = 0;
     int errnum = 0;
 
-    // the timeout arg from lua is optional. See the comments on 
+    // the timeout arg from lua is optional. See the comments on
     // wait_for_event__() for the semantics of this argument
     lua_settop(L,1);
     if (lua_type(L, 1) != LUA_TNIL){   // 1 argument, it must be an integer
-        luaL_checktype(L,1,LUA_TNUMBER); 
+        luaL_checktype(L,1,LUA_TNUMBER);
         int res = 0;
         timeout = lua_tointegerx(L, 1, &res);
         if(!res) luaL_error(L,"failed to get timeout arg: must be an integer");
     }
+
+    if (equeue.count) goto success; // return immediately if pending events
 
     if (wait_for_event__(timeout, &errnum)){     // failed
         lua_pushinteger(L, 1);
         lua_pushfstring(L, "%s", strerror(errnum));
         return 2;
     }
-    else{
-        lua_pushinteger(L, 0);
-        return 1;
-    }
+
+success:
+    lua_pushinteger(L, 0);
+    return 1;
 }
 
 /*
  * Create an interval timer that calls callback on interval expiration.
  *
  * This function creates an interval timer that will expire every
- * INTERVAL milliseconds. The first expiration occurs INTERVAL milliseconds 
+ * INTERVAL milliseconds. The first expiration occurs INTERVAL milliseconds
  * from NOW. On each expiration, an 'event' is added to the
- * global event queue (`equeue`) which gets processed (ideally 
+ * global event queue (`equeue`) which gets processed (ideally
  * as often as possible to ensure greater time precision) periodically
  * by lua_process_events (called from within lua), which dequeues and
- * handles every event in the queue until it's empty. 
+ * handles every event in the queue until it's empty.
  * Each event added represents a callback that needs to be called back,
  * registered from within a lua script by passing it as the 2nd param
- * to this function. 
+ * to this function.
  *
- * The result of this function, in Lua, is a `struct data` full userdata.
+ * The result of this function, in Lua, is a `struct mockit` full userdata.
  * This MUST be assigned to a variable, in that it identifies the
- * associated interval timer created, which needs to be called 
+ * associated interval timer created, which needs to be called
  * destroy() on when no longer needed / when the user wants to disable
  * it.
  *
- * Therefore this function must be called like this:
- *    local timer_obj = luamockit.this_function(5,mycallback)
- * and then, when timer_obj is no longer needed: 
+ * Therefore this function must be called like this for instance:
+ *    local timer_obj = luamockit.<this_function>(5,mycallback)
+ * and then, when timer_obj is no longer needed:
  *    timer_obj = timer_obj:destroy() // see the timer_destroy() function below
  *
  *
  * The lua thread from within which this function got called is saved and the
  * asssociated event (timer expiration) will call back into lua using this same
- * thread (NOTE: lua thread != POSIX thread); 
- * The thread/state is anchored in the registry to ensure it doesn't disappear 
+ * thread (NOTE: lua thread != POSIX thread);
+ * The thread/state is anchored in the registry to ensure it doesn't disappear
  * (it does not get garbage-collected).
- * However, since correct usage of this library normally consists of an infinite 
- * loop (see "Lua script Design") mostly sleeping and periodically calling 
- * lua_process_events() or spending most of its time waiting on semaphore signalling 
+ * However, since correct usage of this library normally consists of an infinite
+ * loop (see "Lua script Design") mostly sleeping and periodically calling
+ * lua_process_events() or spending most of its time waiting on semaphore signalling
  * in lua_process_events(), it's NOT expected that multiple Lua threads will be used.
  * Although this library will, as mentioned, use the Lua thread it was called from,
  * correct behavior is not guaranteed if multiple threads are in actuality used.
@@ -666,7 +649,7 @@ int lua_wait_for_events(lua_State *L){
  *     a callback to call on timer expiration. This must take no arguments.
  *
  * <-- return @lua
- *     a `struct data` full userdata to be assigned to a variable in Lua.
+ *     a `struct mockit` full userdata to be assigned to a variable in Lua.
  *
  * IMPLEMENTATION NOTES
  * ----------------------
@@ -689,9 +672,8 @@ int Mockit_get_interval_timer(lua_State *L){
         return 1;
     }
 
-    // save Lua callback and lua thread in the Lua registry
-    // they'll be retrieved from there when the callback gets
-    // called on timer expiration
+    // save Lua callback and lua thread in the Lua registry;
+    // fetch them when calling callback on timer expiration
     int lua_callback_ref = luaL_ref(L,LUA_REGISTRYINDEX);
     if(lua_callback_ref == LUA_REFNIL){
         luaL_error(L,"failed to save Lua callback in the Lua registry");
@@ -703,11 +685,14 @@ int Mockit_get_interval_timer(lua_State *L){
         luaL_error(L,"failed to save lua thread in the Lua registry");
         return 1;
     }
- 
-    // else, we successfully got the refereces
-    struct data *dt = lua_newuserdata(L, sizeof(struct data));
-    if (!dt){
-        luaL_error(L,"Failed to allocate memory for data struct");
+
+    // else, we successfully got the references
+    struct mockit *mit = lua_newuserdata(L, sizeof(struct mockit));
+    memset(mit, 0, sizeof(struct mockit)); /* lua returns dirty memory */
+
+    struct luamockit *lmit = calloc(1,sizeof(struct luamockit));
+    if (!mit || !lmit){
+        luaL_error(L,"Failed to allocate memory for timer object");
         return 1;
     }
 
@@ -718,29 +703,31 @@ int Mockit_get_interval_timer(lua_State *L){
         luaL_error(L,"failed to save mockit userdata in the Lua registry");
         return 1;
     }
-    
-    /* save unique references of 1) lua callback, 2) lua state
-     * 3) mockit userdata in the lua registry. */
-    dt->refs[LUA_CB_REG_IDX]       = lua_callback_ref;
-    dt->refs[LUA_STATE_REG_IDX]    = lua_state_ref;
-    dt->refs[LUA_USERDATA_REG_IDX] = lua_userdata_ref; 
 
-    dt->ctx = L; // used to pass the lua_State to callback
-    dt->timeout = (uint32_t) timeout;
-    dt->cb = add_event_to_queue__;
-    dt->free_ctx = false;   // do NOT free either context or data as a whole on timer destruction
-    dt->free_data = false;
-    dt->is_cyclic__ = true;
+    /* save unique references in Lua registry for
+     * 1) lua callback 2) lua state 3) mockit userdata */
+    lmit->lua_cb_ref = lua_callback_ref;
+    lmit->lua_state_ref = lua_state_ref;
+    lmit->lua_udata_ref = lua_userdata_ref;
+    lmit->lua_state = L;
 
-    if(Mockit_getit(dt->timeout, dt)){
+    mit->ctx = lmit;
+    mit->timeout__ = (uint32_t) timeout;
+    mit->cb = add_event_to_queue__;
+    mit->destructor = mockit_cthread_finalizer;
+    mit->is_cyclic__ = true;
+    mit->self_destr__ = true;
+
+    printf(":: ARMING interval timer with ival=%u\n", mit->timeout__);
+    if(Mockit_arm(mit)){
         luaL_error(L,"failed to set up interval timer");
         return 1;
     }
 
     res = luaL_getmetatable(L, MOCKIT_MT);
-    if (!res){ 
-        luaL_error(L, "failed to find metatable for mockit object"); 
-        return 1; 
+    if (!res){
+        luaL_error(L, "failed to find metatable for mockit object");
+        return 1;
     }
     lua_setmetatable(L, -2); // set MOCKIT_MT as the userdata's metatable
     lua_insert(L,1);         // the userdata -- move it to index 1 and
@@ -755,20 +742,20 @@ int Mockit_get_interval_timer(lua_State *L){
 }
 
 /*
- * Register a one-off callback from a lua script i.e. the callback 
+ * Register a one-off callback from a Lua script i.e. the callback
  * registered only gets called back ONCE.
  *
  * --> timeout, @lua
  *     The duration to wait for, in milliseconds, before calling the callback.
- * 
+ *
  * --> lua function, @lua
  *     a callback lua function that takes no arguments.
  *
  * <-- return, @lua
- *     Calling this function in LUA does NOT return anything, therefore, unlike 
- *     the function for creating an interval timer, the return value of this 
- *     function (no return value) doesn't need to be assigned to a variable and 
- *     therefore the destroy() metamethod CANNOT be called on it because the user
+ *     Calling this function in LUA does NOT return anything; therefore, unlike
+ *     the function for creating an interval timer, the return value of this
+ *     function (no return value) doesn't need to be assigned to a variable and
+ *     so the destroy() metamethod CANNOT be called on it because the user
  *     would be calling it on nil.
  *
  * A One-off callback is implemented by sleeping for a period of time
@@ -776,7 +763,7 @@ int Mockit_get_interval_timer(lua_State *L){
  * and then adding an event to the global event queue here, on wakeup.
  * The callback gets called when lua_process_events() gets around
  * to processing the respective event in the queue. That is to say, even
- * if the event is generated on time, if the user does not process the 
+ * if the event is generated on time, if the user does not process the
  * respective event for 30 minutes, then no callback will be called until then!
  */
 int Mockit_register_oneoff_callback(lua_State *L){
@@ -787,7 +774,7 @@ int Mockit_register_oneoff_callback(lua_State *L){
     luaL_checktype(L,1,LUA_TNUMBER);   // interval value
     luaL_checktype(L,2,LUA_TFUNCTION); // callback function
 
-    uint32_t timeout = (uint32_t) lua_tointegerx(L,1,&res);
+    uint32_t timeout = (uint32_t) lua_tointegerx(L, 1, &res);
     if(!res){
         luaL_error(L,"failed to get interval value: must be an integer");
     }
@@ -803,72 +790,148 @@ int Mockit_register_oneoff_callback(lua_State *L){
     if(lua_state_ref == LUA_REFNIL){
         luaL_error(L,"failed to save lua state in the Lua registry");
     }
-    
+
+    struct luamockit *lmit = calloc(1,sizeof(struct luamockit));
+
     // allocate and initialize a data object that the callback will be called with
-    struct data *dt = Mockit_dynamic_data_init(add_event_to_queue__, timeout, L, false, false);
-    if (!dt){
-        luaL_error(L,"Failed to allocate memory for data struct");
+    struct mockit *mit = Mockit_dynamic_init(add_event_to_queue__,
+                                            timeout,
+                                            false,
+                                            lmit,
+                                            false,
+                                            NULL
+                                            );
+    if (!mit || !lmit){
+        luaL_error(L,"Failed to allocate memory for timer object");
     }
-    dt->refs[LUA_CB_REG_IDX]    = lua_callback_ref;// unique lua registry ref to callback
-    dt->refs[LUA_STATE_REG_IDX] = lua_state_ref;   // unique lua registry ref to lua state/thread for anchoring
+    lmit->lua_state = L;
+    lmit->lua_cb_ref = lua_callback_ref;// unique lua registry ref to callback
+    lmit->lua_state_ref= lua_state_ref;   // unique lua registry ref to lua state/thread for anchoring
 
     // sleep happens in separate thread; therefore we can return to lua immediately
-    if(Mockit_oneoff(timeout, dt)){
+    if(Mockit_arm(mit)){
         luaL_error(L,"failed  to register one-off callback");
     }
 
     return 0;
 }
 
-/* 
- * Monitor the list and do NOT return until an event with 
- * the specified struct data address is seen that has MOD
- * set. This is in orded to be certain the event has been
+/*
+ * Monitor the event queue and do NOT return until an event with
+ * the specified struct mockit memory address is seen that has the
+ * MOCKIT_MOD mark set. This is in orded to be certain the event has
  * been seen and destroyed in the wake of disarming a timer.
  * TLDR; this function acts as a guarantor of a timer's associated
- * resources actually being deleted.
+ * resources actually being released.
  */
-static int wait_for_MOD(struct data *addr){
-    struct event *curr = equeue.head;
+static int wait_for_MOD(struct mockit *addr){
+    struct event *curr = NULL;
     struct event *prev = curr;
-    const int timeout = 5000;
+    struct event *tmp = NULL;
+    
     for (;;){
-        puts("waiting for event");
-        assert(!wait_for_event__(timeout, NULL));
+        printf("Waiting for MOD: waiting for event semaphore post for %u ms\n", LUAMOCKIT_MOD_WAIT_TIMEOUT);
+        assert(!wait_for_event__(LUAMOCKIT_MOD_WAIT_TIMEOUT, NULL));
         assert(!pthread_mutex_lock(&qmtx));
 
-        if (!prev){
-            curr = equeue.head;
-        }else{
-            curr = prev;
-        }
-        puts("while loop");
+        curr = prev ? prev : equeue.head;
+
+        long unsigned i = 0;
+        while (curr){
+            printf(" * iteration around the loop: %lu, count=%lu, pending=%lu\n", ++i, equeue.count, equeue.pending);
+
+            if (curr->data != addr){
+                printf(" -- looking at %p, different from %p, continuing\n", curr->data, (void *)addr);
+                prev = curr;
+                curr = curr->next;
+                continue;
+            }
+            
+            printf(" -- found %p at i=%lu, mark=%u, timer=%u\n", (void *)addr, i, curr->mark, ((struct mockit *)curr->data)->timeout__);
+            uint32_t timeout = ((struct mockit *)curr->data)->timeout__;
+            // curr == addr
+            tmp = curr;
+ 
+           // remove actual event from queue 
+            if (!is_qhead(&equeue, curr) && !is_qtail(&equeue, curr)){
+                printf(" -> current node: not head, not tail!\n");
+                curr = curr->next;
+                prev->next = curr;
+            }
+
+            else if (is_qhead(&equeue, curr) && is_qtail(&equeue, curr)){
+                printf(" -> current node: head and tail both!\n");
+                curr = NULL;
+                equeue.head = equeue.tail = curr;  // empty queue
+            }
+
+            else if(is_qhead(&equeue, curr)){
+                printf(" -> current node: just head\n");
+                equeue.head = curr->next;
+                curr = curr->next;
+            }
+            
+            else if (is_qtail(&equeue, curr)){
+                printf(" -> current node: just tail\n");
+                equeue.tail = prev;
+                curr = NULL;
+                prev->next = curr;
+            }
+
+            uint8_t mark = tmp->mark;
+            struct mockit *mit = tmp->data;
+            struct luamockit *lmit = mit->ctx;
+            event_destroy__(tmp);
+            equeue.count--;
+            
+            if (!Mockit_hasmod(mark) && !Mockit_ismfd(mark)){
+                printf(" ! normal callback -- destroying, decrementing pending\n");
+                equeue.pending--;
+            }
+            else if(Mockit_ismfd(mark) && !Mockit_hasmod(mark)){
+                printf(" ! mfd only found, still waiting for MOD\n");
+            }
+            else if(Mockit_hasmod(mark)){
+                printf(" -- @@ SAW MOD, cleanup complete @@ for %p at i=%lu, mark=%u, timer=%u\n", (void *)addr, i, mark, timeout);
+                remove_lua_refs(lmit, true);
+                free(lmit);
+                goto unlock;
+            }
+       }
+
+#if 0 
         while(curr && (curr->data != addr || !Mockit_hasmod(curr->mark))){
             //printf("curr is %p\n", (void *)curr);
             prev = curr; /* resume from here on new event enqueued, rather than from the beginning */
             curr = curr->next;
         }
+
         assert(!pthread_mutex_unlock(&qmtx));
         if (curr && curr->data == addr && Mockit_hasmod(curr->mark)){
             fprintf(stderr, "SAW MOD\n");
             break;
         }
     }
-
+#endif
+    }
+unlock:
+    assert(!pthread_mutex_unlock(&qmtx));
     return 0;
 }
 
+
+
+
 /*
- * Destroy an interval timer ('mockit' object.)
+ * Destroy an interval timer object.
  *
  * --> mockit object, @lua
- *     the struct data userdata representing the timer object ('mockit')
- *     to destroy. 
+ *     the struct mockit userdata representing the timer object to destroy.
  *
- * <-- return
+ * <-- return @lua
  *     nil: this should be assigned back to the timer object being destroyed.
  *
- * This is a metamethod to be called in lua like this:
+ * This is a metamethod to be called in Lua like this:
  *    timer_obj = timer_obj:destroy()
  * where timer_obj holds the return value of a call
  * to lua_get_interval_timer() made previously, e.g.
@@ -876,23 +939,23 @@ static int wait_for_MOD(struct data *addr){
  *
  * This metamethod must ONLY be called on a value returned by
  * lua_get_interval_timer(), since lua_get_oneoff_timer() returns
- * no result and therefore need not, cannot and must not be called 
+ * no result and therefore need not, cannot and must not be called
  * destroy() on.
  *
  * For interval timer objects, the result of this function MUST be
- * assigned back to the variable holding the object the user is 
+ * assigned back to the variable holding the object the user is
  * trying to destroy. That's because the object being destroyed is
  * a userdata, which means its memory is handled by lua, and it can't
- * be garbage collected until all references to it are gone. 
+ * be garbage collected until all references to it are gone.
  * the destroy() metamethod returns nil, and assigning that back
  * to the variable holding the userdata will therefore remove
  * all references and makes it so that it can be garbage collected.
  *
  * This of course assumes that is the ONLY reference to the respective
  * userdata / timer object. Therefore the user MUST NOT have multiple
- * variables pointing to the same object. Each call to 
+ * variables pointing to the same object. Each call to
  * lua_get_interval_timer() MUST be assigned to a single unique variable
- * in lua that destroy() is then called on and its return value assigned 
+ * in lua that destroy() is then called on and its return value assigned
  * back to. Otherwise the user must make sure all references (Lua variables
  * pointing to said interval timer object / userdata) are set to nil when
  * the interval timer is no longer needed and its garbage collection is
@@ -902,9 +965,9 @@ int destroy_interval_timer(lua_State *L){
     bool wait_and_clean = false;
     // check arguments in Lua
     lua_settop(L, 2);
-    luaL_checkudata(L,1, MOCKIT_MT);
-    struct data *dt = lua_touserdata(L,1);
-    if (!dt){  // NOT a userdata, invalid argument
+    luaL_checkudata(L, 1, MOCKIT_MT);
+    struct mockit *mit = lua_touserdata(L,1);
+    if (!mit){  // NOT a userdata, invalid argument
         luaL_error(L, "Invalid function argument: not a userdata (mockit object expected)");
     }
 
@@ -914,12 +977,22 @@ int destroy_interval_timer(lua_State *L){
     }
     // can't call free on userdata as that's lua-managed memory;
     // simply disarm timer (mark it for deletion) and return nil to Lua
-    Mockit_disarm(dt);
-    
+    //Mockit_disarm(mit);
+
     //printf("lua stack size is %i\n", lua_gettop(L));
+
+    printf(":: DESTROYING interval timer with mit=%p ival=%u and mark=%u\n", (void*)mit, mit->timeout__, mit->mark__);
     if (wait_and_clean){
-        printf("waiting for cleanup\n");
-        wait_for_MOD(dt);
+        printf("waiting for thread to join \n");
+        if (Mockit_destroy(mit, -1)){
+            luaL_error(L, "Failed to destroy timer object (pthread_join error)");
+        }
+
+        printf("waiting for MOD\n");
+        wait_for_MOD(mit);
+    }
+    else{
+        Mockit_disarm(mit);
     }
     //printf("lua stack size is %i\n", lua_gettop(L));
     lua_pushnil(L); // the result of this function should be assigned back to the timer object
@@ -929,19 +1002,19 @@ int destroy_interval_timer(lua_State *L){
 /*
  * Make a BLOCKING call to clock_nanosleep() in the same thread.
  *
- * --> duration
+ * --> duration @lua
  *     the amount of time to sleep in milliseconds.
- * 
- * --> do_restart
+ *
+ * --> do_restart @lua
  *     True if the sleep should be restarted/resumed after a signal interrupt.
- *     False if on any interruption the call should give up and return the 
+ *     False if on any interruption the call should give up and return the
  *     number of milliseconds left until sleep would have been completed.
  *
  * <-- remaining
- *     time left to sleep in ms. If do_restart is true, sleep always completes,
+ *     time left to sleep in ms. If do_restart is true sleep always completes,
  *     so this value will always be 0.
- * 
- * <-- return 
+ *
+ * <-- return
  *     0 on sucess, an error number on error i.e. a tuple of (error code, remaining)
  *     is returned, which is (0,0) on success, and (errno, time_left) on error.
  */
@@ -960,14 +1033,14 @@ int luasleep(lua_State *L){
 
     uint32_t remaining = 0;
     int error_code     = 0;
-    
+
     if ((error_code = Mockit_bsleep(sleep_time, restart_sleep, &remaining))){
         luaL_error(L, "Call to sleep failed : %s", strerror(error_code));
     }
-    
+
     lua_pushinteger(L, remaining);
     lua_pushinteger(L, error_code);
-   
+
     return 2;   // returns time left to sleep, error code
 }
 
@@ -976,7 +1049,7 @@ int luasleep(lua_State *L){
  * or a tuple of (nil, error code) on failure.
  *
  * The error code on failure is the value of errno set by
- * clock_gettime() (see the Mockit_gettime() comments in 
+ * clock_gettime() (see the Mockit_gettime() comments in
  * mockit.h).
  *
  * <-- return, @lua
@@ -988,12 +1061,12 @@ int luasleep(lua_State *L){
 int get_time_tuple(lua_State *L){
     time_t secs;
     long ms;
-    int res = 0;
+    int rc = 0;
 
     // failure
-    if (( res = Mockit_gettime(&secs, &ms))){
-        lua_pushnil(L); 
-        lua_pushinteger(L, res);
+    if (( rc = Mockit_gettime(&secs, &ms)) ){
+        lua_pushnil(L);
+        lua_pushinteger(L, rc);
     }
     // success
     else{
@@ -1037,6 +1110,7 @@ const struct luaL_Reg luamockit[] = {
     {"getit", Mockit_get_interval_timer},
     {"process_events", lua_process_events},
     {"wait", lua_wait_for_events},
+    {"pending", get_pending_events_count},
     {NULL, NULL}
 };
 

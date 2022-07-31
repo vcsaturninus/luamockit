@@ -68,9 +68,11 @@ clean:
 
 tests: ctests luatests
 
-ctests: make_dirs build_clib
+build_ctests: make_dirs build_clib
 	@ echo "[ ] Running C tests (mockit)..."
 	@ $(CC) $(CFLAGS) $(CPPFLAGS) -Isrc $(TESTS_DIR)/$(C_TESTS_FILE) -L$(OUT_DIR) -l:mockit.so -o out/$(C_TESTS_BIN)
+
+run_ctests: build_ctests
 	@ LD_LIBRARY_PATH=$(realpath $(OUT_DIR)/):$(LD_LIBRARY_PATH) $(OUT_DIR)/$(C_TESTS_BIN)
 	@ echo ""
 
@@ -80,7 +82,7 @@ luatests: make_dirs build_lualib
 	@ echo ""
 
 VALGRIND_REPORT:=valgrind.txt
-grind:
+grind: clean build_ctests
 	LD_LIBRARY_PATH=$(realpath $(OUT_DIR)/):$(LD_LIBRARY_PATH) \
 	valgrind --leak-check=full --show-leak-kinds=all \
 		--track-origins=yes --verbose \

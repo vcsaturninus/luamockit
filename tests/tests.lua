@@ -107,35 +107,34 @@ end
 
 
 function dummy_callback()
+    print("called lua callback")
     global_buffer[1] = luamockit.mstimestamp()
 end
 
 
 function test_one_off_timer(ms, callback)
+    local ERROR_RANGE = 30
     local start_timestamp = luamockit.mstimestamp()
     local expected_end = start_timestamp + ms
 
     luamockit.oneoff(ms, callback)
     luamockit.wait()
+    print("pending event count: ", luamockit.pending())
     luamockit.process_events()
 
     local actual_end = global_buffer[1]
-
-    if not (expected_end <= actual_end+ERROR_RANGE or expected_end >= actual_end-ERROR_RANGE) then
-        mutils.reveal("expected_end (%s) != actual_end (%s)", expected_end, actual_end)
+    
+    print(string.format("start_timestamp = %s, end_timestamp = %s", start_timestamp, actual_end))
+    if not (expected_end <= actual_end+ERROR_RANGE and expected_end >= actual_end-ERROR_RANGE) then
+        mutils.reveal("expected_end (%s) != actual_end (%s) (diff = %s)", expected_end, actual_end, expected_end - actual_end)
         return false
     end
     
-    if not (expected_end <= actual_end+ERROR_RANGE and expected_end >= actual_end-ERROR_RANGE) then
-        mutils.reveal("expected and actual timestamps after luamockit.oneoff() differ: expected=%s, actual=%s", expected_end, actual_end)
-        return false
-    end
-
     return true
 end
 
 function test_interval_timer(duration, interval)
-    local ERROR_RANGE = 30;
+    local ERROR_RANGE = 60;
     local timestamps = {}
     local start_timestamp = luamockit.mstimestamp()
     local end_timestamp = start_timestamp + duration
@@ -175,45 +174,46 @@ function run_test(f, ...)
 end
 
 
---print(" ===================== Running luamockit tests ======================= ... ")
---print(" @ Running time precision tests on mockit.time()")
---run_test(test_time_precision, 1, 230)
---run_test(test_time_precision, 0, 130)
---run_test(test_time_precision, 0, 2000)
---run_test(test_time_precision, 0, 1785)
---run_test(test_time_precision, 0, 013)
---run_test(test_time_precision, 0, 007)
---run_test(test_time_precision, 0, 001)
---run_test(test_time_precision, 3, 1111)
+print(" ===================== Running luamockit tests ======================= ... ")
+print(" @ Running time precision tests on mockit.time()")
+run_test(test_time_precision, 1, 230)
+run_test(test_time_precision, 0, 130)
+run_test(test_time_precision, 0, 2000)
+run_test(test_time_precision, 0, 1785)
+run_test(test_time_precision, 0, 013)
+run_test(test_time_precision, 0, 007)
+run_test(test_time_precision, 0, 001)
+run_test(test_time_precision, 3, 1111)
 
---print(" @ Validating precision of mockit.mstimestamp()")
---run_test(test_mstimestamp, 1, 230)
---run_test(test_mstimestamp, 0, 130)
---run_test(test_mstimestamp, 0, 2000)
---run_test(test_mstimestamp, 0, 1785)
---run_test(test_mstimestamp, 0, 013)
---run_test(test_mstimestamp, 0, 007)
---run_test(test_mstimestamp, 0, 001)
---run_test(test_mstimestamp, 3, 1111)
---run_test(test_mstimestamp, 3, 613)
---
---print(" @ Running time precision tests on mockit.sleep()")
---run_test(test_sleep_precision, 231)
---run_test(test_sleep_precision, 30)
---run_test(test_sleep_precision, 2001)
---run_test(test_sleep_precision, 1787)
---run_test(test_sleep_precision, 013)
---run_test(test_sleep_precision, 007)
---run_test(test_sleep_precision, 001)
---run_test(test_sleep_precision, 11111)
+print(" @ Validating precision of mockit.mstimestamp()")
+run_test(test_mstimestamp, 1, 230)
+run_test(test_mstimestamp, 0, 130)
+run_test(test_mstimestamp, 0, 2000)
+run_test(test_mstimestamp, 0, 1785)
+run_test(test_mstimestamp, 0, 013)
+run_test(test_mstimestamp, 0, 007)
+run_test(test_mstimestamp, 0, 001)
+run_test(test_mstimestamp, 3, 1111)
+run_test(test_mstimestamp, 3, 613)
 
---print(" @ Testing one-off callbacks -- mockit.oneoff() ...")
---run_test(test_one_off_timer, 3000, dummy_callback)
---run_test(test_one_off_timer, 2783, dummy_callback)
---run_test(test_one_off_timer, 1, dummy_callback)
---run_test(test_one_off_timer, 7, dummy_callback)
---run_test(test_one_off_timer, 13, dummy_callback)
---run_test(test_one_off_timer, 1300, dummy_callback)
+print(" @ Running time precision tests on mockit.sleep()")
+run_test(test_sleep_precision, 231)
+run_test(test_sleep_precision, 30)
+run_test(test_sleep_precision, 2001)
+run_test(test_sleep_precision, 1787)
+run_test(test_sleep_precision, 013)
+run_test(test_sleep_precision, 007)
+run_test(test_sleep_precision, 001)
+run_test(test_sleep_precision, 11111)
+
+print(" @ Testing one-off callbacks -- mockit.oneoff() ...")
+run_test(test_one_off_timer, 5555, dummy_callback)
+run_test(test_one_off_timer, 3000, dummy_callback)
+run_test(test_one_off_timer, 2783, dummy_callback)
+run_test(test_one_off_timer, 1, dummy_callback)
+run_test(test_one_off_timer, 7, dummy_callback)
+run_test(test_one_off_timer, 13, dummy_callback)
+run_test(test_one_off_timer, 1300, dummy_callback)
 
 print(" @ Testing precision of interval timers ... ")
 run_test(test_interval_timer, 3000, 100)
@@ -224,6 +224,13 @@ run_test(test_interval_timer, 10000, 2000)
 run_test(test_interval_timer, 7000, 70)
 run_test(test_interval_timer, 21000, 93)
 run_test(test_interval_timer, 77, 7)
+
+print("left == " .. luamockit.pending())
+
+
+function dummy()
+    print("callled dummy")
+end
 
 print(string.format("passed: %s of %s", tests_passed, tests_run))
 if not (tests_passed == tests_run) then os.exit(11) end

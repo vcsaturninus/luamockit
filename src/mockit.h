@@ -47,9 +47,9 @@
  * on seconds and nanosecond values (e.g. for example nanosleep() expects seconds and nanoseconds).
  * These constants are used for conversion between seconds, miliseconds, and nanoseconds.
  */
-#define NS_IN_SECS 1000000000   // 10^9
-#define MS_IN_SECS 1000         // 10^3
-#define NS_IN_MS   1000000      // 10^6
+#define NS_IN_SECS 1000000000LU   // 10^9
+#define MS_IN_SECS 1000U          // 10^3
+#define NS_IN_MS   1000000LU      // 10^6
 
 /* The CLOCK type to use with clock_naonosleep(), clock_gettime() etc;
  * alternative options are commented out */
@@ -71,7 +71,7 @@
 struct mockit{
     pthread_t thread_id__;    // thread_id for timer thread created for each one-shot or interval timer
     uint8_t is_cyclic__  : 1, // flag to mark interval timers; these are destroyed differently from one-off timers
-            mark__       : 5, // used to communicate the destruction state
+            mark__       : 2, // used to communicate the destruction state
             self_destr__ : 1, // whether the timer should self destruct and clean up on expiry/deactivation
             free_mem__   : 1; // used to let the timer thread know not to call free() on the `struct mockit`
     void   *ctx;              // used for passing any object to a callback e.g. pass the lua_State or user-defined struct
@@ -97,7 +97,7 @@ void Mockit_static_init(
                              bool cyclic,
                              void *ctx,
                              bool self_destruct,
-                             int (*destructor)(void *)
+                             int (*destructor)(void *mockit)
                              );
 
 struct mockit *Mockit_dynamic_init(
@@ -106,7 +106,7 @@ struct mockit *Mockit_dynamic_init(
                              bool cyclic,
                              void *ctx,
                              bool self_destruct,
-                             int (*destructor)(void *ctx)
+                             int (*destructor)(void *mockit)
                              );
 
 int Mockit_destroy(struct mockit *dt, int32_t timeout);

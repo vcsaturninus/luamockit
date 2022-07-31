@@ -34,8 +34,10 @@ extern void timespec_add_ms__(struct timespec *timespec, uint32_t ms);
 // conditional printf
 #define reveal(fmt, ...) if (getenv("DEBUG_MODE")) fprintf(stderr, fmt, ##__VA_ARGS__);
 
-int data_destructor(void *ctx){
-    free(ctx);
+int data_destructor(void *mit){
+    struct mockit *m = mit;
+    free(m->ctx);
+    free(m);
     puts("in destructor, freed data");
 
     return 0;
