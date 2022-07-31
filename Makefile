@@ -11,6 +11,10 @@ CFLAGS:= -g -Wall -Werror -std=$(C_STANDARD) -pedantic -fstrict-aliasing -Wcast-
 INCLUDES:=includes/
 CPPFLAGS:=-I$(INCLUDES) $(FEATURE_TEST_MACROS)
 
+ifdef DEBUG_MODE
+CPPFLAGS += -DDEBUG_MODE
+endif
+
 # the realtime library is needed for the POSIX clocks and interval timers API
 # the pthead library is needed for semaphore and mutex suport
 LDFLAGS:=-l$(LUA_VERSION) -lpthread -lrt
@@ -23,7 +27,7 @@ LUA_TESTS_FILE:=tests.lua
 C_TESTS_FILE:=tests.c
 C_TESTS_BIN:=ctests
 
-MOCKIT_SOURCES:=$(SRC_DIR)/mockit.c
+MOCKIT_SOURCES:=$(SRC_DIR)/mockit.c $(SRC_DIR)/common.c
 LUA_MOCKIT_SOURCES:=$(SRC_DIR)/luamockit.c
 CLIB_SONAME:=mockit.so
 LUALIB_SONAME:=lua$(CLIB_SONAME)
@@ -67,6 +71,8 @@ clean:
 .PHONY : tests ctests luatests
 
 tests: ctests luatests
+
+ctests: build_ctests run_ctests
 
 build_ctests: make_dirs build_clib
 	@ echo "[ ] Running C tests (mockit)..."

@@ -129,10 +129,117 @@ will unblock either as soon as a new event is generated or after timeout millise
 -- whichever comes first.
 
 
-Timer expirations and destroying timers
---------------------------------------------
+One-off timers and interval timers
+-------------------------------------
 
-* cover mark of destruction etc
+A one-off timer will sleep for the specified duration in a separate
+thread, then exit. An interval timer will _repeatedly_ sleep for the
+specified duration in a separate thread _until disarmed_, then exit.
+
+On each timer expiry (**only one for one-off timers, by definition**),
+the callback associated with the timer gets called. The callback gets
+called in the same thread as the timer i.e. not in the main thread.
+It's the responsibility of the user to ensure the callback is
+thread-safe and/or reentrant etc as needed.
+
+Timer expirations, timer disarming, and timer destruction
+----------------------------------------------------------------
+
+Because interval timers oscillate forever between sleeping and then
+waking up and calling the associated callback, there must be a way to
+tell them to stop. You do this by _disarming_ them.
+Conversely, because one-off timers only sleep and wake up _once_
+there is no need to disarm them (and they _cannot_ be disarmed).
+
+Disarming an interval timer may not happen instantaneously. A mark
+(`MOCKIT_MFD`, see source code) is set in a certain field of the
+struct representing the timer to let the timer know it's been
+disarmed. On each wakeup, the timer (I'm using 
+_the timer_ as shorthand for _the thread function implementing the
+timer functionality_ or _the thread in charge of the timer_) will
+check this field and if `MOCKIT_MFD` has been set it knows it's been
+disarmed  so it does not call the associated callback again nor does
+it go to sleep again: instead, the timer just exits and performs
+cleanup actions.
+
+Before doing any cleanup, the timer will set the `MOCKIT_MOD` mark in
+the respective struct field, as a way of acknolwedging to the caller
+that it's seen the `MOCKIT_MFD` mark i.e. the disarming request.
+The user should _not_ check for `MOCKIT_MOD` or any such mark after
+the timer terminates as they would be committing `use-after-free`.
+However the user could implement a destructor that does not free the
+timer resources and can use these (or similar) mark mechanism as a
+means of communication. `luamockit` takes this precise approach in
+order to synchronize resource release.
+
+### Timer cleanup / destruction
+
+Disarming an interval timer (as mentioned, one-shot timers cannot be
+disarmed) simply gets the timer to stop. It does _not_ in and of
+itself release the resources associated with the timer back to the
+system.
+
+To release said resources, a timer must be _destroyed_. There are a
+few nuances here: 
+ 1. the `pthread` resources associated with the thread itself must be freed
+ 2. the timer object (`struct mockit`) and any user-allocated memory
+    pointed to by the `ctx` field of the `mockit` struct must also be
+    freed.
+
+Each will be covered in turn.
+ 1. Releasing pthread resources
+
+One-off timers always run in `detached` mode, i.e. they do not have to
+be `joined`. Nothing special needs to be done here.
+
+Interval timers do _not_, on the other hand, detach themselves. They
+must therefore be joined at the end to release their resources back to
+the system. Disarming an interval timer and then joining the
+associated thread are both done via the common `destroy` function used
+with interval timers.
+
+2. Releasing memory associated with the timer object/struct
+
+Both one-off and interval timers are **self-destroying**, meaning they
+clean up after themselves when exiting the thread (as explained
+below).
+
+At destruction time, a timer will by default simply run `free()` on the 
+timer object (`struct mockit`) before exitting the thread. The `ctx`
+field is not freed. If the user uses this field (which is reserver for
+arbitrary use by the user) to point to some arbitrary memory
+(user-allocated or not), they should also provide a destructor
+function that knows how to tear down the timer. 
+
+If a destructor function is provided by the user, it should take of
+freeing _both_ the `struct mockit` (if dynamically initialized/allocated)
+and_ any memory pointed to by the `ctx` field of this struct as 
+appropriate. If the user makes use of the `ctx` field and points it 
+to some dynamically-allocated chunk of memory but they do not provide 
+a suitable destructor, memory leakage may ensue.
+
+It's vital to keep the following points in mind:
+ * the user _must_ call `Mockit_destroy()` on _interval_ timers to
+   free their resources. `Mockit_destroy()` calls `Mockit_disarm()`
+   implicitly on interval timers, hence users need not call the latter
+   and should only call the former.
+
+ * one-off timers _cannot_ be destroyed. They're only disarmed and
+   then they self-destruct when they get around to it. Calling
+   `Mockit_destroy()` on a one-shot timer is completely synonymous
+   with caling `Mockit_disarm()`.
+
+ * Note that if the timer is long-run, it may not make sense to wait
+   until the timer wakes up before being able to exit the program.
+   Imagine the (somewhat absurd) scenario where a timer (interval or
+   one-off) is set to a duration/interval of 1h. The user must then
+   **wait** for 1h until the timer wakes up and sees `Mockit_MFD` has
+   been set, after which it will exit. In such a scenario, it may be
+   preferable to simply exit the program without waiting: the
+   resources will be released back to the `OS` after program exit
+   anyway. This is all the more so with one-off timers as they
+   _cannot_ be joined so there's no way to wait for their completion
+   other than sleeping.
 
 
 Lua script design

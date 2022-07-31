@@ -12,6 +12,12 @@
 #define LUAMOCKIT
 #include "mockit.h"
 #include "morre.h"
+#include "common.h"
+
+#ifdef DEBUG_MODE
+extern int DEBUG;
+#endif
+
 
 /* metatable in Lua for interval timer object ('mockit');
  * exposed to lua code as a full userdata
@@ -20,13 +26,6 @@
 
 /* Timeout value when waiting for a MOCKIT_MOD-marked event */
 #define LUAMOCKIT_MOD_WAIT_TIMEOUT 5000
-
-
-#ifdef DEBUG_MODE
-#   define say(...) say__(__VA_ARGS__)
-#else 
-#   define say(...) ; /* empty  statement */
-#endif
 
 
 /* ================================ *
@@ -137,6 +136,8 @@ static sem_t esem;
 /* defined in mockit.c */
 extern void timespec_add_ms__(struct timespec *ts, uint32_t ms);
 extern uint8_t Mockit_setmod(uint8_t mark);
+extern bool Mockit_ismfd(uint8_t mark);
+extern bool Mockit_hasmod(uint8_t mark);
 
 /*
  * Used to ensure that before the thread in charge of the timer exits
@@ -149,9 +150,16 @@ extern uint8_t Mockit_setmod(uint8_t mark);
 static int mockit_cthread_finalizer(void *mit){
     assert(mit);
     struct mockit *m = mit;
+    
+
+    /* for one-off timers simply return; the point of the finalizer here
+     * is to stop mockit's default behavior of calling free() */
+    if (!m->is_cyclic__) return 0;
+
     unsigned int mark = m->mark__ ;
+    (void) mark;
     m->mark__ = Mockit_setmod(m->mark__);
-    printf("finalizer : setting MOD for event with ival=%u, mit %p , lmit  %p; before - %u, after - %u\n", ((struct mockit*)mit)->timeout__, (void *)mit, (void *)m->ctx, mark, m->mark__);
+    say(DEBUG, "finalizer : setting MOD for event with ival=%u, mit %p , lmit  %p; before - %u, after - %u\n", ((struct mockit*)mit)->timeout__, (void *)mit, (void *)m->ctx, mark, m->mark__);
     m->cb(m);
 
     return 0; /* success */
@@ -191,6 +199,10 @@ void remove_lua_refs(struct luamockit *lmit, bool cyclic){
  *     ignored.
  */
 int lua_initialize(int *errnum){
+#ifdef DEBUG_MODE
+    if (getenv("DEBUG_MODE")) DEBUG = 1;
+#endif
+
     errno = 0;
 
     if (sem_init(&esem,0,0)){
@@ -311,7 +323,7 @@ static struct event *event_create__(void){
     //printf("calloc returned ev=%p\n", ev);
 
     if (!ev){
-        fprintf(stderr, "Memory allocation failure: failed to mallocate event struct\n");
+        say(DEBUG, "Memory allocation failure: failed to mallocate event struct\n");
         exit(MORRE_MEM_ALLOC);
     }
 
@@ -405,13 +417,14 @@ static struct event *event_dequeue__(struct event_queue *queue){
 static void add_event_to_queue__(void *arg){
     struct event *ev = event_create__();
 
-    if (pthread_mutex_lock(&qmtx)) exit(MORRE_MUTEX);
+    if (pthread_mutex_lock(&qmtx)) exit(MORRE_MTX);
 
     ev->data = arg;
     ev->mark = ((struct mockit *)arg)->mark__;
     ev->cyclic = ((struct mockit *)arg)->is_cyclic__ ? true : false;
     struct mockit *mm = ev->data;
-    printf("-- CALLBACK: add_event_to_queue__: enqueueing event %p, cyclic=%i, mark=%u, mit=%p, ival=%u \n", (void *)ev, ev->cyclic, ev->mark, (void*)ev->data, mm->timeout__);
+    (void) mm;
+    say(DEBUG, "-- CALLBACK: add_event_to_queue__: enqueueing event %p, cyclic=%i, mark=%u, mit=%p, ival=%u \n", (void *)ev, ev->cyclic, ev->mark, (void*)ev->data, mm->timeout__);
 
     //fprintf(stderr, "ev->mark is %i when enqueing\n", ev->mark);
 
@@ -419,10 +432,10 @@ static void add_event_to_queue__(void *arg){
 
     int errnum = signal_event__();
     if (errnum){
-        fprintf(stderr, "%s ('%s')\n", "failed to post event", strerror(errnum));
+        say(DEBUG, "%s ('%s')\n", "failed to post event", strerror(errnum));
     }
 
-    if(pthread_mutex_unlock(&qmtx)) exit(MORRE_MUTEX);
+    if(pthread_mutex_unlock(&qmtx)) exit(MORRE_MTX);
 }
 
 /*
@@ -440,9 +453,9 @@ static void add_event_to_queue__(void *arg){
 static struct event *get_event_from_queue__(void){
     struct event *ev = NULL;
 
-    if (pthread_mutex_lock(&qmtx)) exit(MORRE_MUTEX);
+    if (pthread_mutex_lock(&qmtx)) exit(MORRE_MTX);
     ev = event_dequeue__(&equeue);
-    if (pthread_mutex_unlock(&qmtx)) exit(MORRE_MUTEX);
+    if (pthread_mutex_unlock(&qmtx)) exit(MORRE_MTX);
 
     return ev;
 }
@@ -490,7 +503,7 @@ int lua_process_events(lua_State *L){
         mit = event->data;
         struct luamockit *lmit = mit->ctx;
         lua_State *Lstate = lmit->lua_state;
-        printf("handling event=%p mockit=%p with lmit=%p, mark=%u, cyclic=%i, ival=%u\n", (void *)event, (void *)mit, (void *)lmit, event->mark, event->cyclic, mit->timeout__);
+        say(DEBUG, "handling event=%p mockit=%p with lmit=%p, mark=%u, cyclic=%i, ival=%u\n", (void *)event, (void *)mit, (void *)lmit, event->mark, event->cyclic, mit->timeout__);
  
         lua_rawgeti(Lstate, LUA_REGISTRYINDEX, lmit->lua_cb_ref);
         // printf("cb ref is %i, lmit = %p\n", lmit->lua_cb_ref, (void *)lmit);
@@ -500,7 +513,7 @@ int lua_process_events(lua_State *L){
 
         /* one-off timers generate a single event => handle then release resources */
         if (!event->cyclic){
-            fprintf(stderr, "--> one-shot: freeing data\n");
+            say(DEBUG, "--> one-shot: freeing data\n");
 
             // lua callback function must take no params and return no values
             lua_pcall(Lstate, 0, 0, 0);
@@ -518,7 +531,7 @@ int lua_process_events(lua_State *L){
             /* interval timer MOCKIT_MFD-marked event: skip it; this precedes
              * a last MOCKIT_MOD-marked interval timer event */
             else if ( Mockit_ismfd(event->mark) && !Mockit_hasmod(event->mark)){
-                fprintf(stderr, "mark (%i) has mfd, skipping\n", event->mark);
+                say(DEBUG, "mark (%i) has mfd, skipping\n", event->mark);
                 event_destroy__(event);
                 continue;  /* do not count as 'handled' */
             }
@@ -526,7 +539,7 @@ int lua_process_events(lua_State *L){
             else if (Mockit_hasmod(event->mark)){
                 // interval timers are lua-managed userdata: cannot call free on them.
                 // one-off timers otoh must be deallocated here.
-                fprintf(stderr, "@@ HAS MOD MARK SET, CLEANING UP\n");
+                say(DEBUG, "@@ HAS MOD MARK SET, CLEANING UP\n");
                 remove_lua_refs(lmit, true);
                 free(lmit);
                 event_destroy__(event);
@@ -716,7 +729,6 @@ int Mockit_get_interval_timer(lua_State *L){
     mit->cb = add_event_to_queue__;
     mit->destructor = mockit_cthread_finalizer;
     mit->is_cyclic__ = true;
-    mit->self_destr__ = true;
 
     printf(":: ARMING interval timer with ival=%u\n", mit->timeout__);
     if(Mockit_arm(mit)){
@@ -798,8 +810,7 @@ int Mockit_register_oneoff_callback(lua_State *L){
                                             timeout,
                                             false,
                                             lmit,
-                                            false,
-                                            NULL
+                                            mockit_cthread_finalizer 
                                             );
     if (!mit || !lmit){
         luaL_error(L,"Failed to allocate memory for timer object");
@@ -984,7 +995,7 @@ int destroy_interval_timer(lua_State *L){
     printf(":: DESTROYING interval timer with mit=%p ival=%u and mark=%u\n", (void*)mit, mit->timeout__, mit->mark__);
     if (wait_and_clean){
         printf("waiting for thread to join \n");
-        if (Mockit_destroy(mit, -1)){
+        if (Mockit_destroy(mit)){
             luaL_error(L, "Failed to destroy timer object (pthread_join error)");
         }
 

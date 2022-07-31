@@ -142,7 +142,7 @@ static void IntervalCallback(void *stuff){
 */
 static bool test_oneoff_timer(uint64_t ms){
     struct mockit mit;
-    Mockit_static_init(&mit, OneOffCallback, ms, false, NULL, false, NULL);
+    Mockit_static_init(&mit, OneOffCallback, ms, false, NULL, NULL);
     
     uint64_t start = 0;
     assert(!Mockit_mstimestamp(&start));
@@ -185,7 +185,7 @@ static bool test_oneoff_timer(uint64_t ms){
    Therefore we should allow for an error marging of 1.
 */
 static bool test_interval_timers(uint64_t duration, uint64_t interval){
-    struct mockit *mit = Mockit_dynamic_init(IntervalCallback, interval, true, NULL, true, data_destructor);
+    struct mockit *mit = Mockit_dynamic_init(IntervalCallback, interval, true, NULL, data_destructor);
     
     uint64_t start = 0;
     assert(!Mockit_mstimestamp(&start));
@@ -193,7 +193,7 @@ static bool test_interval_timers(uint64_t duration, uint64_t interval){
 
     assert(!Mockit_arm(mit));
     assert(!Mockit_bsleep(duration, true, NULL));
-    int rc = Mockit_destroy(mit, -1);
+    int rc = Mockit_destroy(mit);
     printf("rc = %i\n", rc);
     
     reveal("Interval callback was called %lu times. Expected: %lu+/-%i\n", post, expected_total_calls,ERROR_RANGE);

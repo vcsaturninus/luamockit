@@ -2,8 +2,10 @@
 #define MORRE_H__
 
 /* Error constants */
-#   define MORRE_MEM_ALLOC    7
-#   define MORRE_MUTEX        8
-# define MORRE_SEM            9
+enum morre{
+    MORRE_MEM_ALLOC = 7,
+    MORRE_MTX,
+    MORRE_SEM
+};
 
 #endif

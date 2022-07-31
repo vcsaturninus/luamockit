@@ -170,3 +170,9 @@ t2 = nil
 
 ## TODOs
     * increase fixed-width int type used from 32 to 64 bits
+
+
+## Luamockit design
+
+![luamockit architecture design](/docs/luamockit.drawio.svg "luamockit architecture design")
+

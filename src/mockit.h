@@ -72,7 +72,6 @@ struct mockit{
     pthread_t thread_id__;    // thread_id for timer thread created for each one-shot or interval timer
     uint8_t is_cyclic__  : 1, // flag to mark interval timers; these are destroyed differently from one-off timers
             mark__       : 2, // used to communicate the destruction state
-            self_destr__ : 1, // whether the timer should self destruct and clean up on expiry/deactivation
             free_mem__   : 1; // used to let the timer thread know not to call free() on the `struct mockit`
     void   *ctx;              // used for passing any object to a callback e.g. pass the lua_State or user-defined struct
     uint32_t timeout__;       // number of milliseconds before (one-off or interval) callback gets called
@@ -86,17 +85,12 @@ int Mockit_mstimestamp(uint64_t *timestamp);
 
 int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left);
 
-int Mockit_oneoff(struct mockit *mit);
-
-int Mockit_getit(struct mockit *mit);
-
 void Mockit_static_init(
                              struct mockit *mit,
                              void (*cb)(void *mockit),
                              uint32_t timeout,
                              bool cyclic,
                              void *ctx,
-                             bool self_destruct,
                              int (*destructor)(void *mockit)
                              );
 
@@ -105,15 +99,11 @@ struct mockit *Mockit_dynamic_init(
                              uint32_t timeout,
                              bool cyclic,
                              void *ctx,
-                             bool self_destruct,
                              int (*destructor)(void *mockit)
                              );
 
-int Mockit_destroy(struct mockit *dt, int32_t timeout);
-
 int Mockit_arm(struct mockit *mit);
 void Mockit_disarm(struct mockit *mit);
-bool Mockit_hasmod(uint8_t mark);
-bool Mockit_ismfd(uint8_t mark);
+int Mockit_destroy(struct mockit *dt);
 
 #endif

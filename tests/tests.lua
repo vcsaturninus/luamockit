@@ -107,7 +107,7 @@ end
 
 
 function dummy_callback()
-    print("called lua callback")
+    --print("called lua callback")
     global_buffer[1] = luamockit.mstimestamp()
 end
 
@@ -124,7 +124,7 @@ function test_one_off_timer(ms, callback)
 
     local actual_end = global_buffer[1]
     
-    print(string.format("start_timestamp = %s, end_timestamp = %s", start_timestamp, actual_end))
+    --print(string.format("start_timestamp = %s, end_timestamp = %s", start_timestamp, actual_end))
     if not (expected_end <= actual_end+ERROR_RANGE and expected_end >= actual_end-ERROR_RANGE) then
         mutils.reveal("expected_end (%s) != actual_end (%s) (diff = %s)", expected_end, actual_end, expected_end - actual_end)
         return false
