@@ -6,8 +6,8 @@ Mockit - C and Lua timer callback library
     * [Mockit_gettime](#Mockit_gettime)  
     * [Mockit_mstimestamp](#Mockit_mstimestamp)  
     * [Mockit_bsleep](#Mockit_bsleep)  
-    * [One-off timers](#One-off/one-shot timers)  
-    * [Interval timers](#Interval/cyclic timers)  
+    * [One-off timers](#One-off/one-shot-timers)  
+    * [Interval timers](#Interval/cyclic-timers)  
 * [Luamockit](#Luamockit)
 
 
