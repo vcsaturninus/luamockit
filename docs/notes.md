@@ -9,6 +9,7 @@ Mockit - C and Lua timer callback library
     * [One-off timers](#one-off-timers)  
     * [Interval timers](#interval-timers)  
 * [Luamockit](#Luamockit)
+    * [Luamockit Design and Implementation notes](#luamockit-design-and-implementation-notes)
 
 
 Mockit
@@ -212,6 +213,86 @@ int main(int argc, char **argv){
 
 Luamockit
 -----------
+
+Shown below is an extended example of how you would use the Lua interface
+to `mockit`. The code is pretty self-explanatory and the comments
+should also help make it that much clearer.
+
+```Lua
+#!/usr/bin/lua5.3
+
+package.cpath = package.cpath .. ";" .. "../out/?.so;"
+
+local mit = require("luamockit")
+
+-- get millisecond timestamp
+local msts = mit.mstimestamp() -- e.g. 1659732124334
+
+-- get secs,ms time tuple
+local s,ms = mit.time()        -- e.g. 1659732124, 334
+
+-- sleep for 2.3 seconds; resume if interrupted by a signal handler etc
+mit.sleep(2300, true)
+
+-- sleep for 0.07 seconds; just stop if interrupted
+mit.sleep(70) -- same as lmit.sleep(2300, false)
+
+
+-- dummy callback to be associated with timer expiry events
+local function cb()
+    print(string.format("called at %s", mit.mstimestamp()))
+end
+
+---------------------------------------------------------------
+-- one-off timer example: process event after arbitrary time --
+---------------------------------------------------------------
+mit.oneoff(2000, cb)
+--- do stuff (or sleep) for arbitrary period of time ---
+
+-- 1 or 0 depending on whether the timer has expired
+pending = mit.pending()
+print("pending = " .. pending)
+
+-- this will call cb IFF the timer has in fact expired and the
+-- resulting timer expiry event has been enqueued
+mit.process_events()
+
+----------------------------------------------------
+-- one-off timer example: block until event ready --
+----------------------------------------------------
+mit.oneoff(3500, cb)
+
+-- only unblocks on event enqueue or (optional) specified ms timeout
+mit.wait(8000)
+mit.process_events()
+
+----------------------------------------------------------------
+-- interval timer example: process event after arbitrary time --
+----------------------------------------------------------------
+-- generate expiry event every 0.2 secs
+local it = mit.getit(200, cb)
+-- do stuff or sleep for arbitrary of time
+mit.sleep(2000)
+pending = mit.pending()   -- e.g. 10
+mit.process_events()      -- call cb as a result of timer expiry events
+
+-- wait indefinitely to properly clean up timer-associated resources;
+-- remove references to object so it can be garbage collected
+it = it:destroy(true)
+
+----------------------------------------------------
+-- interval timer example: process events forever --
+----------------------------------------------------
+-- this is particularly suited to daemons running an infinite
+-- loop that need to perform an action at regular intervals
+it = mit.getit(1300, cb)
+while true do
+    mit.wait() -- block indefinitely until event ready
+    mit.process_events()
+end
+```
+
+## Luamockit Design and Implementation notes
 
 ![Luamockit system design diagram](luamockit.svg "Luamockit
 design diagram")
