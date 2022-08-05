@@ -3,20 +3,21 @@ Mockit - C and Lua timer callback library
 
 ##### Table of Contents  
 * [Mockit](#Mockit)  
-    * [Mockit_gettime](# Mockit_gettime)  
-    * [Mockit_mstimestamp](# Mockit_mstimestamp)  
-    * [Mockit_bsleep](# Mockit_bsleep)  
-    * [one-off timers](# one-off/one-shot timers)  
-    * [interval timers](# Interval/cyclic timers)  
-* [Luamockit](# Luamockit)
+    * [Mockit_gettime](#Mockit_gettime)  
+    * [Mockit_mstimestamp](#Mockit_mstimestamp)  
+    * [Mockit_bsleep](#Mockit_bsleep)  
+    * [One-off timers](#One-off/one-shot timers)  
+    * [Interval timers](#Interval/cyclic timers)  
+* [Luamockit](#Luamockit)
 
 
 Mockit
 --------
 
-### `Mockit_gettime()`: get (seconds, milliseconds) time tuple
+### `Mockit_gettime()`
 
-get seconds since the Unix epoch and milliseconds since the last second.
+ * get (secs, msecs) time tuple; secs = seconds since 
+   the Unix epoch; msecs= milliseconds since the last second.
 
 ```C
 time_t secs = 0;
@@ -25,20 +26,26 @@ Mockit_gettime(&secs, &msecs);
 printf("%zus, %lums\n", secs, msecs); // e.g. 1659641952s, 561ms
 ```
 
-### `Mockit_mstimestamp()` : get milisecond timeLuamockit
+### `Mockit_mstimestamp()`
+
+* get milisecond timestamp
+
 Timestamps in seconds since the unix epoch are extremely common. The
 `date` utility can be used for this in the shell, the `C` standard
 library's `time()` returns such a timestamp, and so forth.
 It's sometimes the case that _millisecond_ timestamps are needed
 though. One normally has to use more precise APIs for this purpose. 
 `Mockit_mstimestamps()` aims to be such a convenience function.
+
 ```C
 uint64_t msts = 0;
 Mockit_mstimestamp(&msts);
 printf("msts: %" PRIu64 "\n", msts);  // e.g. msts: 1659642227734
 ```
 
-### `Mockit_bsleep()`: go to sleep for specified milliseconds
+### `Mockit_bsleep()`
+
+ * go to sleep for specified number of milliseconds
 
 The function `sleep()` is often too coarse; the function `nanosleep()`
 may be too heavy and inconvenient to use. `Mockit_bsleep()` is aimed
@@ -62,7 +69,7 @@ specified duration which ends with a user-registered callback being
 called on timer expiry. Since by definition this 'timer' only expires
 _once_, it is only _once_ that the callback gets called.
 
-![Sequence diagram of one-off timers](docs/mockit_one-off_timer.svg "One-off timers")
+![Sequence diagram of one-off timers](mockit_one-off_timer.svg "One-off timers")
 
 The callback is expected to have a certain prototype and the timer
 itself requires certain cleanup on teardown. The user may (or may
@@ -144,7 +151,7 @@ in acknowledgement, _not_ call the callback, and then perform either
 default cleanup or otherwise call a destructor function, if
 registered.
 
-![Sequence diagram of interval timers](docs/mockit_interval_timer.svg "Interval timers")
+![Sequence diagram of interval timers](mockit_interval_timer.svg "Interval timers")
 
 An example of an interval timer with default cleanup is shown next:
 ```C
@@ -207,7 +214,7 @@ int main(int argc, char **argv){
 Luamockit
 -----------
 
-![Luamockit system design diagram](docs/luamockit.svg "Luamockit
+![Luamockit system design diagram](luamockit.svg "Luamockit
 design diagram")
 
 
