@@ -3,7 +3,6 @@
 
 #include "common.h"
 
-
 void say__(int flag, char *fmt, ...){
     if (!flag) return;
     va_list va;

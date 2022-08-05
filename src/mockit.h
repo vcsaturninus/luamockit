@@ -27,14 +27,14 @@
  |  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,  |
  |  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE  |
  |  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.           |
-  \*===============================================================================*/
+ \*===============================================================================*/
 
 #include <pthread.h>
 #include <stdbool.h>
 #include <time.h>
 #include <stdint.h>
 
-/* suppress warning about variable being declared but not used */
+/* suppress warnings about variable being declared but unused */
 #if defined(__GNUC__) || defined(__GNUG__) || defined(__clang__)
 # define UNUSED(x) x __attribute__((unused))
 #else
@@ -59,24 +59,22 @@
 
 
 
-/* __ -postfixed members are set by the library functions and should not
- * be modified by the user. The user should modify this struct by using the
- * accessor functions e.g. `Mockit_set_cb()` rather than acessing the struct
- * fields directly by dereference. The `ctx` field is provided to give the user
- * flexibility: it can be used to point at anything the user wants e.g. a
- * dynamically allocated struct the user defines.
- * The user must write an appropriate callback that knows how to free ctx; this
- * callback will be called by the Mockit destroy function(s).
+/*
+ * __ -postfixed members are set by the library functions and should not
+ * be modified by the user other than via the init function.
+ * The `ctx` field is reserved for arbitrary use by the user. If used,
+ * the user should provide a destructor function that knows how free
+ * it as well if necessary.
  */
 struct mockit{
     pthread_t thread_id__;    // thread_id for timer thread created for each one-shot or interval timer
     uint8_t is_cyclic__  : 1, // flag to mark interval timers; these are destroyed differently from one-off timers
             mark__       : 2, // used to communicate the destruction state
-            free_mem__   : 1; // used to let the timer thread know not to call free() on the `struct mockit`
-    void   *ctx;              // used for passing any object to a callback e.g. pass the lua_State or user-defined struct
+            free_mem__   : 1; // used to let the timer thread know (not) to call free() on the `struct mockit`
+    void   *ctx;              // for arbitrary use by the user; if used, destructor should be provided as well
     uint32_t timeout__;       // number of milliseconds before (one-off or interval) callback gets called
     void (*cb)(void *mockit); // function to call on expiry of one-off or interval timer
-    int (*destructor)(void *ctx); // function to call to free the user-allocated ctx; can be NULL if ctx unused
+    int (*destructor)(void *ctx); // optional function to call on timer termination to release resources
 };
 
 int Mockit_gettime(time_t *secs, long *ms);
