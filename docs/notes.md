@@ -6,8 +6,8 @@ Mockit - C and Lua timer callback library
     * [Mockit_gettime](#Mockit_gettime)  
     * [Mockit_mstimestamp](#Mockit_mstimestamp)  
     * [Mockit_bsleep](#Mockit_bsleep)  
-    * [One-off timers](#One-off/one-shot-timers)  
-    * [Interval timers](#Interval/cyclic-timers)  
+    * [One-off timers](#one-off-timers)  
+    * [Interval timers](#interval-timers)  
 * [Luamockit](#Luamockit)
 
 
@@ -62,7 +62,7 @@ Mockit_bsleep(2100, false, NULL);
 Mockit_bsleep(70, false, NULL);
 ```
 
-### One-off/one-shot timers
+### One-off timers
 
 A one-off aka one-shot timer is a sleep in a separate thread for the
 specified duration which ends with a user-registered callback being
@@ -135,7 +135,7 @@ int main(int argc, char **argv){
 }
 ```
 
-### Interval/cyclic timers
+### Interval timers
 
 While one-off timers are inherently self-disarming, interval aka
 cyclic timers will keep going until explicitly disarmed.
@@ -208,8 +208,7 @@ int main(int argc, char **argv){
     Mockit_destroy(mit);
 }
 ```
-
-=========================================================
+------------------------------------------------
 
 Luamockit
 -----------
