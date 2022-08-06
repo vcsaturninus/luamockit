@@ -99,7 +99,7 @@ struct event{
  */
 struct event_queue{
     struct event *head, *tail;
-    uint64_t count;   /* acual count */
+    uint64_t count;   /* all entries in the queue, indiscriminately */
     uint64_t pending; /* only pending events, excluding ones that have a mark set */
 };
 
@@ -342,6 +342,25 @@ static inline void event_destroy__(struct event *ev){
     free(ev);
 }
 
+/* 
+ * Return true if the event is considered to be pending, 
+ * else false. 
+ *
+ * Only interval timer events that do NOT have either MOD
+ * or MFD set, and one-off timer events are considered pending.
+ * I.e. interval timer events with either MOD or MOD set are
+ * not deemed to be pending events.
+ */
+static inline bool is_pending__(struct event *ev){
+    assert(ev);
+    if (ev->cyclic && (Mockit_ismfd(ev->mark) || Mockit_hasmod(ev->mark)))
+    {
+        return false;
+    }
+
+    return true;
+}
+
 /*
  * Add an event struct to the event queue at the tail end.
  *
@@ -364,7 +383,7 @@ static void event_enqueue__(struct event_queue *queue, struct event *event){
     }
 
     queue->count++;
-    if (!Mockit_hasmod(event->mark) && !Mockit_ismfd(event->mark)) queue->pending++;
+    if (is_pending__(event)) queue->pending++;
 }
 
 /*
@@ -398,7 +417,7 @@ static struct event *event_dequeue__(struct event_queue *queue){
     }
 
     queue->count--;
-    if (!Mockit_hasmod(res->mark) && !Mockit_ismfd(res->mark)) queue->pending--;
+    if (is_pending__(res)) queue->pending--;
 
     return res;
 }
@@ -558,6 +577,13 @@ int lua_process_events(lua_State *L){
 
 /*
  * Return the count of pending events in the event queue.
+ * 
+ * Note this includes all one-off timer events and only interval
+ * timer events that have neither MFD nor MOD set because such
+ * events are simply dequeued and ignored and not 'handled' (lua
+ * callback does not get called back for them).
+ * Only one-off timer events and unmarked timer events as described
+ * are 'handled' and can be said to be 'pending'.
  *
  * <-- int @lua
  *     count of events in the event queue waiting to be handled.
@@ -567,10 +593,33 @@ int get_pending_events_count(lua_State *L){
     
     /* race condition, but it's inconsequential. We're interested 
      * in the number of events in equeue at the time of checking. */
+    lua_pushinteger(L, equeue.pending);
+
+    return 1;
+}
+
+/*
+ * Return the total count of entries in the event queue.
+ 
+ * Note this includes both pending items (see `get_pending_events_count`
+ * above) as well as event structs currently in the queue that will 
+ * NOT be handled (specifically interval timer events that have 
+ * either MFD or MOD set).
+ *
+ * <-- int @lua
+ *     count of entries currently in the event queue
+ */
+int get_total_entries_in_queue(lua_State *L){
+    lua_settop(L, 0); // no args
+    
+    /* race condition, but it's inconsequential. We're interested 
+     * in the number of events in equeue at the time of checking. */
     lua_pushinteger(L, equeue.count);
 
     return 1;
 }
+
+
 
 /*
  * Block until an event is posted to the event queue.
@@ -892,10 +941,11 @@ static int wait_for_MOD(struct mockit *addr){
             uint8_t mark = tmp->mark;
             struct mockit *mit = tmp->data;
             struct luamockit *lmit = mit->ctx;
+            bool pending = is_pending__(tmp);
             event_destroy__(tmp);
             equeue.count--;
             
-            if (!Mockit_hasmod(mark) && !Mockit_ismfd(mark)){
+            if (pending){
                 printf(" ! normal callback -- destroying, decrementing pending\n");
                 equeue.pending--;
             }
@@ -909,21 +959,6 @@ static int wait_for_MOD(struct mockit *addr){
                 goto unlock;
             }
        }
-
-#if 0 
-        while(curr && (curr->data != addr || !Mockit_hasmod(curr->mark))){
-            //printf("curr is %p\n", (void *)curr);
-            prev = curr; /* resume from here on new event enqueued, rather than from the beginning */
-            curr = curr->next;
-        }
-
-        assert(!pthread_mutex_unlock(&qmtx));
-        if (curr && curr->data == addr && Mockit_hasmod(curr->mark)){
-            fprintf(stderr, "SAW MOD\n");
-            break;
-        }
-    }
-#endif
     }
 unlock:
     assert(!pthread_mutex_unlock(&qmtx));
@@ -1035,12 +1070,17 @@ int luasleep(lua_State *L){
     // check arguments in Lua
     lua_settop(L,2);
     luaL_checktype(L, 1, LUA_TNUMBER);
-    luaL_checktype(L, 2, LUA_TBOOLEAN);
+
     uint32_t sleep_time = (uint32_t) lua_tointegerx(L,1,&res);
     if (!res){
         luaL_error(L, "incorrect time value specified for sleep duration.");
     }
-    bool restart_sleep = lua_toboolean(L, 2);
+
+    bool restart_sleep = false;
+    if (lua_type(L, 2) != LUA_TNIL){
+        luaL_checktype(L, 2, LUA_TBOOLEAN);
+        restart_sleep = lua_toboolean(L, 2);
+    }
 
     uint32_t remaining = 0;
     int error_code     = 0;
@@ -1122,6 +1162,7 @@ const struct luaL_Reg luamockit[] = {
     {"process_events", lua_process_events},
     {"wait", lua_wait_for_events},
     {"pending", get_pending_events_count},
+    {"inqueue", get_total_entries_in_queue},
     {NULL, NULL}
 };
 
