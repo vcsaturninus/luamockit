@@ -155,7 +155,7 @@ specified duration which ends with a user-registered callback being
 called on timer expiry. Since by definition this 'timer' only expires
 _once_, it is only _once_ that the callback gets called.
 
-![Sequence diagram of one-off timers](mockit_one-off_timer.svg "One-off timers")
+![Sequence diagram of one-off timers](docs/mockit_one-off_timer.svg "One-off timers")
 
 The callback is expected to have a certain prototype and the timer
 itself requires certain cleanup on teardown. The user may (or may
@@ -245,7 +245,7 @@ in acknowledgement, _not_ call the callback, and then perform either
 default cleanup or otherwise call a destructor function, if
 registered.
 
-![Sequence diagram of interval timers](mockit_interval_timer.svg "Interval timers")
+![Sequence diagram of interval timers](docs/mockit_interval_timer.svg "Interval timers")
 
 An example of an interval timer with default cleanup is shown next:
 ```C
@@ -536,7 +536,7 @@ which will go through the event queue and dequeue each pending event and 'handle
 To handle an event means to call the Lua callback associated with it, and then
 remove it from the event queue.
 
-![Luamockit system design diagram](luamockit.svg "Luamockit
+![Luamockit system design diagram](svg/luamockit.svg "Luamockit
 design diagram")
 
 Therefore each call to `luamockit.process_events()` has a backlog that it needs to clear.
