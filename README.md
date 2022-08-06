@@ -308,8 +308,6 @@ This section will summarize/explain the details of timer termination
 and cleanup from C perspective. Lua users can choose to skip this
 section.
 
-~~~~~~~~~~~~~~~~~
-
 One-off timers _cannot_ be disarmed. They are self-disarming: they run
 _once_ and then they terminate. The thread they run in is _detached_
 so one-off timers cannot and need not be joined. Default cleanup is
