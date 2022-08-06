@@ -536,8 +536,7 @@ which will go through the event queue and dequeue each pending event and 'handle
 To handle an event means to call the Lua callback associated with it, and then
 remove it from the event queue.
 
-![Luamockit system design diagram](svg/luamockit.svg "Luamockit
-design diagram")
+![Luamockit system design diagram](docs/luamockit.svg "Luamockit design diagram")
 
 Therefore each call to `luamockit.process_events()` has a backlog that it needs to clear.
 The more rarely `luamockit.process_events()` gets called, the bigger the backlog and the
