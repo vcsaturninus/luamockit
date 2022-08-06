@@ -193,10 +193,10 @@ static bool test_interval_timers(uint64_t duration, uint64_t interval){
 
     assert(!Mockit_arm(mit));
     assert(!Mockit_bsleep(duration, true, NULL));
-    int rc = Mockit_destroy(mit);
-    printf("rc = %i\n", rc);
+    assert(!Mockit_destroy(mit));
     
     reveal("Interval callback was called %lu times. Expected: %lu+/-%i\n", post, expected_total_calls,ERROR_RANGE);
+
     if (!(expected_total_calls <= post+ERROR_RANGE && expected_total_calls >= post-ERROR_RANGE)){
         post = 0;
         return false;
@@ -214,23 +214,23 @@ int main(int argc, char **argv){
 
     fprintf(stderr, " @ Ascertaining accuracy and precision of Mockit_mstimestamp()\n");
     run_test(test_mstimestamp, 2000);
-    //run_test(test_mstimestamp, 1313);
-    //run_test(test_mstimestamp, 17);
-    //run_test(test_mstimestamp, 8);
-    //run_test(test_mstimestamp, 1);
-    //run_test(test_mstimestamp, 3771);
-    //run_test(test_mstimestamp, 222);
-    //run_test(test_mstimestamp, 66);
+    run_test(test_mstimestamp, 1313);
+    run_test(test_mstimestamp, 17);
+    run_test(test_mstimestamp, 8);
+    run_test(test_mstimestamp, 1);
+    run_test(test_mstimestamp, 3771);
+    run_test(test_mstimestamp, 222);
+    run_test(test_mstimestamp, 66);
 
     fprintf(stderr, " @ Ascertaining accuracy and precision of Mockit_bsleep()\n");
     run_test(test_bsleep, 9);
-    //run_test(test_bsleep, 99);
-    //run_test(test_bsleep, 999);
-    //run_test(test_bsleep, 9999);
-    //run_test(test_bsleep, 1101);
-    //run_test(test_bsleep, 203);
-    //run_test(test_bsleep, 30);
-    //run_test(test_bsleep, 1);
+    run_test(test_bsleep, 99);
+    run_test(test_bsleep, 999);
+    run_test(test_bsleep, 9999);
+    run_test(test_bsleep, 1101);
+    run_test(test_bsleep, 203);
+    run_test(test_bsleep, 30);
+    run_test(test_bsleep, 1);
 
     fprintf(stderr, " @ Running precision tests for one-off timers ...\n");
     run_test(test_oneoff_timer, 8123);
@@ -253,7 +253,6 @@ int main(int argc, char **argv){
     run_test(test_interval_timers, 8000, 900);
     run_test(test_interval_timers, 103, 10);
 
-    sleep(7);
     fprintf(stderr, "passed: %i of %i\n", tests_passed, tests_run);
     if (tests_passed != tests_run) exit(EXIT_FAILURE);
     exit(EXIT_SUCCESS);
