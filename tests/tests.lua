@@ -119,7 +119,6 @@ function test_one_off_timer(ms, callback)
 
     luamockit.oneoff(ms, callback)
     luamockit.wait()
-    print("pending event count: ", luamockit.pending())
     luamockit.process_events()
 
     local actual_end = global_buffer[1]
@@ -152,7 +151,6 @@ function test_interval_timer(duration, interval)
     end
     
     it = it:destroy(true)
-    print("it is, after destroying it, " .. tostring(it))
     
     local expected = start_timestamp
     for _,stamp in ipairs(timestamps) do
@@ -225,12 +223,6 @@ run_test(test_interval_timer, 7000, 70)
 run_test(test_interval_timer, 21000, 93)
 run_test(test_interval_timer, 77, 7)
 
-print("left == " .. luamockit.pending())
-
-
-function dummy()
-    print("callled dummy")
-end
 
 print(string.format("passed: %s of %s", tests_passed, tests_run))
 if not (tests_passed == tests_run) then os.exit(11) end

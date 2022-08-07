@@ -4,3 +4,5 @@ out/
 files/
 valgrind.txt
 t.c
+t.lua
+q

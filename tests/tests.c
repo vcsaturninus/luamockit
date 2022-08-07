@@ -38,7 +38,6 @@ int data_destructor(void *mit){
     struct mockit *m = mit;
     free(m->ctx);
     free(m);
-    puts("in destructor, freed data");
 
     return 0;
 }
