@@ -13,7 +13,7 @@
 #include "common.h"
 
 #ifdef DEBUG_MODE
-int DEBUG = 0;
+extern int DEBUG;
 #endif
 
 /*
@@ -25,8 +25,8 @@ int DEBUG = 0;
  */
 #define MAX_NS_VAL 999999999L
 
-/*
- * See 'Timer expirations, timer disarming, and timer destruction' in docs.md */
+/* MFD is set to mark a timer as disarmed; MOD is setw
+ * in acknowledgement by the timer thread before thread exit */
 #define MOCKIT_MFD   0x1
 #define MOCKIT_MOD   0x2
 
@@ -48,21 +48,18 @@ typedef void (* timedcb)(void *);
  *
  * mark must normally correspond to a mockit->mark__.
  */
-
 bool Mockit_hasmod(uint8_t mark){
     return (mark & MOCKIT_MOD) ? true : false;
 }
 
 /*
- * Set MOD - the mark of destruction - on mark and return it.
- */
+ * Set MOD - the mark of destruction - in mark and return it */
 uint8_t Mockit_setmod(uint8_t mark){
     return (mark |= MOCKIT_MOD);
 }
 
 /*
- * Set MFD - mark for destruction - on mark and return it.
- */
+ * Set MFD - mark for destruction - in mark and return it. */
 uint8_t Mockit_setmfd(uint8_t mark){
     return (mark |= MOCKIT_MFD);
 }
@@ -79,22 +76,19 @@ bool Mockit_ismfd(uint8_t mark){
 /*
  * Mark for destruction the timer with thread_id.
  *
- * If the caller is responsible for freeing the `struct mockit` i.e.
- * `Mockit_{static,dynamic}_data_init()` was NOT called with self_destruct=true,
-  it should wait until  the thread responsible for the interval timer has
- * acknowledged this, which can be checked with Mockit_mod(). Only then is it safe
- * for the caller to free() the `struct mockit *` (and mockit->ctx, if used).
- *
- * Otherwise if the caller is not responsible for freeing this data, it should
- * consider the mockit object and the ctx desotroyed and no longer use them for
- * anything (e.g. it's illegal to derefence these, call Mockit_mod() on the mockit
- * object,  etc.) once Mockit_disarm() was called.
+ * This will mark the timer object with MFD to let it knoww
+ * to terminate. The timer will set MOD in acknowledgementw
+ * once it's seen the mark. The user must always register aw
+ * destructor so normally MOD is not and cannot used for anything.w
+ * However, the user _could_ conceivably check for this mark inw
+ * the destructor and perhaps delay the destruction or offloadw
+ * it onto another function etc.
  *
  * FMI, see the notes at the top where MOCKIT_MOD and MOCKIT_MFD are defined.
  */
-void Mockit_disarm(struct mockit *mit){
+void Mockit_disarm(struct mockit *timer){
     say(DEBUG, "disarming -- seting mfd\n");
-    mit->mark__ = Mockit_setmfd(mit->mark__);
+    timer->mark__ = Mockit_setmfd(timer->mark__);
 }
 /*
  * Return a time tuple of (seconds, milliseconds).
@@ -133,8 +127,8 @@ int Mockit_gettime(time_t *secs, long *ms){
  *
  * The standard unix timestamp as returned by time()
  * represents the number of seconds since the epoch.
- * However it is sometimes the case that millisecond precision
- * is needed instead. That's what this function does.
+ * However it is sometimes the case that millisecondw
+ * precision is needed instead.
  *
  * <-- timestamp
  *     The number of milliseconds since the epoch.
@@ -172,35 +166,36 @@ int Mockit_mstimestamp(uint64_t *timestamp){
 void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
     assert(ts);
 
+    say(DEBUG, "%s(), 0) => secs=%lu, nsecs=%lu \n", __func__, (*ts).tv_sec, (*ts).tv_nsec);
+
     // convert ms to secs and ns
     uint32_t  secs = milliseconds/ MS_IN_SECS; // sec >= 0; (0 if milliseconds < 1000)
     uint32_t  msecs = milliseconds % MS_IN_SECS;
     uint32_t  nsecs = msecs * NS_IN_MS; // time is given in ms but nanosleep expects ns
+                                        //
+    say(DEBUG, "%s(), 1): secs=%u, msecs=%u,nsecs=%u\n", __func__, secs, msecs, nsecs);
 
     (*ts).tv_sec += secs;
 
     /* the number of nanoseconds the way it's implemented in Mockit, will
        always be < 1s. That is, it can/should be at most 999999999,
        (see MAX_NS_VAL defined above for this purpose) which is 1 nanosecond
-       from a full second.
-    */
+       from a full second. */
     assert(nsecs < MAX_NS_VAL);
 
     /* If you go beyond MAX_NS_VAL, e.g. clock_nanosleep() WILL return an error.
        Therefore care must be taken we always stay within the range. If our value
        of nanoseconds > MAX_NS_VAL, we should convert it to seconds and put it in
-       tv_sec, and only leave the remainder in tv_nsec.
-    */
+       tv_sec, and only leave the remainder in tv_nsec. */
     long ns_free_space = MAX_NS_VAL - (*ts).tv_nsec;
     // there's enough space to accomodate nsecs
     if (ns_free_space >= nsecs){
         (*ts).tv_nsec += nsecs;
     }
+
     // not enough space: chop off the full second
     else{
         nsecs += (*ts).tv_nsec;
-        //todo remove check
-        assert(nsecs < NS_IN_SECS<<1);
         uint8_t num_secs = nsecs / NS_IN_SECS;  /* can only be < 2s */
         (*ts).tv_sec += num_secs;
 
@@ -208,6 +203,7 @@ void timespec_add_ms__(struct timespec *ts, uint32_t milliseconds){
         assert(nsecs <= MAX_NS_VAL);
         (*ts).tv_nsec = nsecs;
     }
+    say(DEBUG, "%s(), 2) => secs=%lu, nsecs=%lu \n", __func__, (*ts).tv_sec, (*ts).tv_nsec);
 }
 
 /*
@@ -263,20 +259,21 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
     struct timespec to_sleep; // current time + milliseconds
     memset(&to_sleep, 0, sizeof(struct timespec));
 
-    if (clock_gettime(MOCKIT_CLOCK_ID, &to_sleep) == -1){
-        say(DEBUG, "clock_gettime failed\n");
-        if (time_left) *time_left = milliseconds;  // have not slept at all
-        return 1;
-    }
-
-    // populate the `struct timespec` correctly, ensuring we stay within the
-    // correct range for tv_nsec
-    timespec_add_ms__(&to_sleep, milliseconds);
-
     // 1)
     // do resume sleep when interrupted by signals => time_left unused
     if (do_restart){
-        // rem is not used when TIMER_ABSTIME is used
+
+        if (clock_gettime(MOCKIT_CLOCK_ID, &to_sleep) == -1){
+            say(DEBUG, "clock_gettime failed\n");
+            if (time_left) *time_left = milliseconds;  // have not slept at all
+            return 1;
+        }
+
+        // populate the `struct timespec` correctly, ensuring we stay within the
+        // correct range for tv_nsec
+        timespec_add_ms__(&to_sleep, milliseconds);
+
+       // rem is not used when TIMER_ABSTIME is used
         res = clock_nanosleep(MOCKIT_CLOCK_ID, TIMER_ABSTIME, &to_sleep, NULL);
 
         if (res){
@@ -285,7 +282,6 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
                     res = clock_nanosleep(MOCKIT_CLOCK_ID, TIMER_ABSTIME, &to_sleep, NULL);
                 }
             }
-
             else{
                 if (time_left) *time_left = milliseconds;
             }
@@ -298,6 +294,7 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
     else{
         struct timespec rem;
         memset(&rem, 0, sizeof(rem));
+        timespec_add_ms__(&to_sleep, milliseconds);
 
         res = clock_nanosleep(MOCKIT_CLOCK_ID, 0, &to_sleep, &rem);
 
@@ -329,23 +326,29 @@ int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left){
 
 static void *oneshot__(void *mockit){
     assert(!pthread_detach(pthread_self()));
-    say(DEBUG, "oneshot called\n");
+
+    say(DEBUG, "entering oneshot__ thread\n");
+
     /* one-off timers sleep ONCE for mockit->timeout time
      * then call mockit->cb and then self-destruct. */
-    struct mockit *mit = mockit;
-    assert(Mockit_bsleep(mit->timeout__, true, NULL) == 0);
-    mit->cb(mit);
+    struct mockit *timer = mockit;
+    assert(Mockit_bsleep(timer->timeout__, true, NULL) == 0);
+    if (Mockit_ismfd(timer->mark__)){
+        say(DEBUG, "oneshot__: not calling cb because timer has been disarmed\n");
+    }else{
+        timer->cb(timer); /* run if not disarmed */
+    }
 
-    if (mit->destructor){
-        say(DEBUG, "in destructor, calling destructor\n");
-        mit->destructor(mit);
-        say(DEBUG, "after destructor\n");
+    if (timer->destructor){
+        say(DEBUG, "oneshot__: calling destructor\n");
+        timer->destructor(timer);
+        say(DEBUG, "oneshot__: after destructor\n");
     }
     else{
-        if (mit->free_mem__) free(mit);
+        if (timer->free_mem__) free(timer);
     }
 
-    puts("calling pthread_exit()");
+    say(DEBUG, "oneshot__: calling pthread_exit()\n");
 
     pthread_exit(NULL);
     return NULL;
@@ -355,9 +358,9 @@ static void *oneshot__(void *mockit){
  * Every interval timer is simply a thread that runs this function until expiry.
  *
  * Interval timers:
- * 1) sleep for for dt->timeout,
- * 2) call dt->cb,
- * 3) IFF the associated mockit mark has mod AND mfd set, they self-destruct,
+ * 1) sleep for for timer->timeout,
+ * 2) call timer->cb,
+ * 3) IFF the associated mockit mark has mfd set, they self-destruct
  * 4) otherwise they go back to 1).
  *
  * <-- return
@@ -365,110 +368,99 @@ static void *oneshot__(void *mockit){
  *     by pthread of thread-entry functions.
  */
 static void *cycle__(void *mockit){
-    struct mockit *mit = mockit;
+    struct mockit *timer = mockit;
     bool mfd = false;
-    uint32_t interval = mit->timeout__;
-    timedcb callback = mit->cb;
+    uint32_t interval = timer->timeout__;
+    timedcb callback = timer->cb;
 
 /* No locking is needed when checking mfd because
  * the thread never sets it, only checks it. If the
  * caller sets it at any point, it will be caught either
  * on this or the next loop pass. The thread then acknolwedges
- * that by setting MOD. Simiarly no locking is required,
- * because the thread only sets it and the caller only ever
- * checks it. Further, the caller only sets MFD ONCE
- * and the thread ONLY sets MOD IFF MFD has been set.
- * By definition therefore these cannot be performed at
- * the same time and there's therefore no race condition
- * that must be protected against.
- */
+ * that by setting MOD.w
+ * sets MOD IFF MFD has been set.  */
 while (!mfd){
     assert(Mockit_bsleep(interval, true, NULL) == 0);
-    say(DEBUG, "calling callback with mit=%p, mark=%u, ival=%u\n", (void *)mit, mit->mark__, mit->timeout__);
-    callback(mit);
+    say(DEBUG, "calling callback with timer=%p, mark=%u, ival=%u\n", (void *)timer, timer->mark__, timer->timeout__);
+    callback(timer);
 
-    mfd = Mockit_ismfd(mit->mark__);
+    mfd = Mockit_ismfd(timer->mark__);
 }
-    //puts("got marked for destruction: will delete and destroy");
-    // otherwise, timer has been marked for destruction;
-    // acknowledge this by setting the 'mark of destruction',
-    // (MOCKIT_MOD) and free the memory if responsible.
-    mit->mark__ = Mockit_setmod(mit->mark__);  /* set mark of destruction */
-    say(DEBUG, "shutting down thread: set mark to %i from %i, mark & MOD = %i\n", mit->mark__, mark, mit->mark__ & MOCKIT_MOD);
+    // otherwise, timer has been marked for destruction; acknowledgew
+    // this by setting the 'mark of destruction',  (MOCKIT_MOD)w
+    // and free the memory if no destructor has been provided
+    timer->mark__ = Mockit_setmod(timer->mark__);  /* set mark of destruction */
+    say(DEBUG, "shutting down thread: set mark to %i from %i, mark & MOD = %i\n", timer->mark__, timer->mark__, timer->mark__ & MOCKIT_MOD);
 
-    // clearly, the caller can and should only check the MOD
-    // IFF the thread is NOT responsible for freeing the resources i.e.
-    // this function does NOT free data.
     int *rc = calloc(1, sizeof(int));
-    if (mit->destructor){
-        puts("---- in destructor, calling destructor");
-        mit->destructor(mockit);
-        puts("---- after destructor");
+    if (timer->destructor){
+        say(DEBUG, "cycle__: calling destructor\n");
+        timer->destructor(mockit);
+        say(DEBUG, "cycle__: after destructor call\n");
     }
     else{
-        if (mit->free_mem__) free(mit);
+        if (timer->free_mem__) free(timer);
     }
+
     pthread_exit(rc);
 }
 
 /*
- * Call a callback ONCE on timer expiration.
+ * Call a callback ONCE on timer expiry.
  *
  * --> time
- *     time, in milliseconds, after which to call data->cb.
+ *     time, in milliseconds, after which to call timer->cb.
  *
- * --> data
+ * --> timerw
  *     a pointer to an initialized `struct mockit`;
  *
- * --> data->cb
+ * --> timer->cb
  *     a callback function that returns a void pointer and takes
  *     a void pointer; mockit WILL always call the callback with a
- *     `struct data` pointer so it must be cast and interpreted as appropriate.
+ *     `struct mockit` pointer so it must be cast and interpreted as appropriate.
  *     The caller must ensure the callback is reentrant or otherwise
  *     thread-safe.
  *
  * <-- return
  *     1 on failure, 0 on success;
  */
-static inline int Mockit_oneoff(struct mockit *mit){
-    if (!mit) return -1;   // data should've been allocated and partly populated by caller
+static inline int Mockit_oneoff(struct mockit *timer){
+    if (!timer) return -1;
 
-    // create a thread that will start life by calling sleeper__; this
-    // will sleep for TIME duration before calling data->cb() with
-    // 'data' as an argument; the thread will store its id in thread_id and will
+    // create a thread that will start life by calling oneshot__; this
+    // will sleep for TIME duration before calling timer->cb() with
+    // 'timer' as an argument; the thread will store its id in thread_id and will
     // use default thread attributes.
-    mit->mark__ = 0;
-    say(DEBUG, "--oneoff will sleep for %u ms\n", mit->timeout__);
-    if (pthread_create(&mit->thread_id__, NULL, oneshot__, mit)) return 1;
+    timer->mark__ = 0;
+    say(DEBUG, "--oneoff will sleep for %u ms\n", timer->timeout__);
+    if (pthread_create(&timer->thread_id__, NULL, oneshot__, timer)) return 1;
 
     return 0;
 }
 
 /*
- * Arrange for data->cb() to be called on interval expiration.
+ * Arrange for timer->cb() to be called on interval expiry.
  *
  * --> interval
  *     the value of the interval, in milliseconds, at which the timer
- *     is to expire and the callback in data->cb is to be called.
+ *     is to expire and the callback in timer->cb is to be called.
  *
- * --> data
+ * --> timerw
  *     an initialized `struct mockit *` (see definition in mockit.h).
- *     DATA is further manipulated and populated by this function before
- *     being returned to the caller - on success.
- *     The timer id of the interval timer created is written to data->timer_id__.
- *     The caller can destroy the associated interval timer by calling Mockit_destroy()
- *     on this id (see Mockit_destroy()).
- *     On failure, data is set to NULL.
+ *     The timer id of the interval timer created is written to timer->timer_id__.
+ *     The caller can destroy the associated interval timer by callingw
+ *     Mockit_destroy() on this id (see Mockit_destroy()).
+ *     On failure, timer is set to NULL.
  *
  * <-- return
  *     0 on success, and the value of errno on error/failure.
  */
-static inline int Mockit_getit(struct mockit *mit){
-    assert(mit);
+static inline int Mockit_getit(struct mockit *timer){
+    assert(timer);
 
     // create a thread that will start life by calling cycle__;
     // store the thread id in thread_id and use default thread attributes
-    if(pthread_create(&mit->thread_id__, NULL, cycle__, mit)){
+    if(pthread_create(&timer->thread_id__, NULL, cycle__, timer)){
         return 1;
     }
 
@@ -476,156 +468,163 @@ static inline int Mockit_getit(struct mockit *mit){
 }
 
 /*
- * Free the dynamic user-allocated memory for the `struct data *`.
+ * Destroy specified interval or disarm one-off timer.w
  *
- * If `->is_cyclic__` is true, also call timer_delete on the timer_id field
- * to disarm and destroy the assumed associated interval timer. Otherwise if
- * `->is_cyclic__` is false, assume one-shot timer and forego the call to
- * timer_delete() (which would otherwise segfault!).
+ * One-off timers can be disarmed, though they're are inherentlyw
+ * self-disarming. Normally a one-off timer sleeps once for thew
+ * set duration, wakes up, calls the associated callback, thenw
+ * terminates. If the sleep duration is long the user may decide
+ * to disarm the callback while it's still asleep. In that case
+ * it will not call the associated callback on wakeup as it has
+ * already been disarmed. If called on a one-off timer, thisw
+ * function is completely synonymous with `Mockit_disarm()`.
  *
- * --> dt
- *     a `struct data *` dynamically allocated by the user (caller) previously.
- *     timer_delete() gets called on `dt->timer_id` to first destroy the interval
- *     timer object (which of course disarms it as well), before calling free() on
- *     `dt` itself.
- *     NOTE: timer_delete() only gets called on `dt->timer_id` IFF `dt->is_cyclic__`
- *     is true i.e. if the timer is an interval timer, not a one-off one.
+ * For interval timers, his function will first disarm the timer,w
+ * then wait for it to either perform default cleanup or call aw
+ * registered destructor, and then _join_ the thread when it exits.
+ * This ensures all resources, including thread ones, are released.
  *
- * --> free_data
- *     If true, then call free() on the (dynamically allocated) dt, else assume dt
- *     has static storage and simply zero it out.
+ * --> timerw
+ *     fully initialized and armed interval or one-off timer objectw
+ *     to be destroyed.w
  *
  * <-- return
- *     errno value set by timer_delete().
- *
- * Subtleties
- * ------------------------------
- * after timer_delete() returns, there is a warranty that no new
- * notifications will happen, but there could be any number of
- * notification still being processed in their own thread.
- * This means there's a distinct risk that if you free dt
- * in this function, the pending threads that will STILL
- * call the callback could execute dt->cb() on the freed
- * dt, therefore performing an illegal read (use after free)
- * by using a dangling pointer.
- *
- * timeout of -1 means wait indefinitely until thread terminates
- * (pthread_join). Otherwise it should be a timeout in ms: if the
- * thread has not terminated in that time frame, give up on destroying it:
- * note this means its resources may not be released.
- *
- * A timeout of zero means that the timer is disarmed but not waited
- * for its actual destruction.
+ *     always 0 for one-off timers; for interval timers, it will bew
+ *     the error code returned by `pthread_join()` (if failed) or thew
+ *     return code passed by the exiting timer thread to `pthread_exit()`
+ *     obtained by this function via `pthread_join()`.
  */
-int Mockit_destroy(struct mockit *mit){
-    assert(mit);
+int Mockit_destroy(struct mockit *timer){
+    assert(timer);
     int rc = 0;
     void *threadrc_ptr = NULL;  /* must be cast to int* */
     int threadrc = 0;
-    int cyclic = mit->is_cyclic__;
+    int cyclic = timer->is_cyclic__;
 
-    Mockit_disarm(mit);
+    Mockit_disarm(timer);
 
     /* no joining for one-off timers; synonymous with Mockit_disarm() */
     if (!cyclic) return 0;
 
     /* interval timers must be joined */
     say(DEBUG, "waiting for thread to join; join returned %i, pthread_exit=%i\n", rc, threadrc);
-    rc = pthread_join(mit->thread_id__, &threadrc_ptr);
+    rc = pthread_join(timer->thread_id__, &threadrc_ptr);
     if (threadrc_ptr){
         threadrc = *(int *)threadrc_ptr;
         free(threadrc_ptr);
     }
 
     if (rc) return 1;
-
-    /* disregard valgrind warning about 'uninitialized value': this is set by pthread_join() */
     if (threadrc) return 2;
-
-return 0;
+    return 0;
 }
 
 /*
- * Dynamically allocate a `struct data *` and zero it out.
+ * Dynamically allocate a timer object and initialize it.
  *
- * The client should call this to get a data struct to pass to
+ * The client may call this to get a timer to pass to
  * Mockit_oneoff() and Mockit_getit().
  *
  * --> cb
  *     a callback with the specified signature that is to be called on
- *     on exiration of one-shot or interval timers.
+ *     on expiry of one-shot or interval timers with a pointer to the
+ *     associated timer object as the sole parameter.
  *
  * --> timeout
  *     The duration (either for a one-shot timer or for an interval timer)
  *     to wait before calling the callback.
  *
+ * --> cyclic
+ *     true if this timer is meant to be an interval timer; false for a one-off
+ *     timer
+ *
  * --> ctx
- *     The callback function will be passed this value as argument when called.
+ *     The callback function will be passed this as a param when called.
+ *     It's for arbitrary use by the user. If used and if dynamically allocated
+ *     by the user or if requiring certain resource cleanup, the user should
+ *     also provide a destructor function.
+ *
+ * --> destructor
+ *     Optional destructor to be called before thread exit. If NULL, the thread
+ *     function will perform some default cleanup (simply call `free()` on the
+ *     timer object if dynamically allocated, else do nothing). Otherwise if
+ *     a destructor is specified, it will be called with a pointer to the timer
+ *     object as the sole parameter.
+ *     The destructor should free BOTH the timer object AND the `ctx` field if used
+ *     and if appropriate (see previous point).
  *
  * <-- return
- *     Dynamically allocated `struct data *`. The blocked has been zeroed
- *     out and is ready to be used by the caller by being passed around
- *     to the other functions here expecting it mentioned above.
+ *     Dynamically allocated and initialized timer object.
  */
 struct mockit *Mockit_dynamic_init(
-                                    void (*cb)(void *mockit),
+                                    void (*cb)(void *timer),
                                     uint32_t timeout,
                                     bool cyclic,
                                     void *ctx,
-                                    int (*destructor)(void *ctx)
+                                    int (*destructor)(void *timer)
                              )
 {
-    struct mockit *dt = calloc(1,sizeof(struct mockit));
-    assert(dt);
+    struct mockit *timer = calloc(1,sizeof(struct mockit));
+    assert(timer);
     assert(cb);
 
-    dt->cb = cb;
-    dt->timeout__ = timeout;
-    dt->destructor = destructor;
-    dt->ctx = ctx;
-    dt->free_mem__ = 1;
-    dt->mark__ = 0;
-    dt->is_cyclic__ = (cyclic) ? 1 : 0;
+    timer->cb = cb;
+    timer->timeout__ = timeout;
+    timer->destructor = destructor;
+    timer->ctx = ctx;
+    timer->free_mem__ = 1;
+    timer->mark__ = 0;
+    timer->is_cyclic__ = (cyclic) ? 1 : 0;
 
-    return dt;
+    return timer;
 }
 
 /*
- * Initialize a statically declared struct data.
+ * Initialize statically allocated timer object.
  *
- * See Mockit_dynamic_data_init fmi.
+ * See `Mockit_dynamic_init()` for an explanation of each
+ * expected parameter.w
+ * The only parameter that differs is the destructor; if provided,
+ * it should only `free()` the `ctx` field if appropriate, butw
+ * _not_ the timer object itself, since it has _not_ been dynamically
+ * allocated.
  */
 void Mockit_static_init(
-                        struct mockit *mit,
-                        void (*cb)(void *mit),
+                        struct mockit *timer,
+                        void (*cb)(void *timer),
                         uint32_t timeout,
                         bool cyclic,
                         void *ctx,
                         int (*destructor)(void *ctx)
                         )
 {
-    assert(mit);
+    assert(timer);
     assert(cb);
-    memset(mit, 0, sizeof(struct mockit));
+    memset(timer, 0, sizeof(struct mockit));
 
-    mit->ctx = ctx;
-    mit->cb = cb;
-    mit->timeout__ = timeout;
-    mit->destructor = destructor;
-    mit->is_cyclic__ = (cyclic) ? 1 : 0;
+    timer->ctx = ctx;
+    timer->cb = cb;
+    timer->timeout__ = timeout;
+    timer->destructor = destructor;
+    timer->is_cyclic__ = (cyclic) ? 1 : 0;
 }
 
-int Mockit_arm(struct mockit *mit){
-    assert(mit);
+/*
+ * Arm a fully-initialized one-off or interval timer.
+ *
+ * Arming a timer creates a new thread appropriate forw
+ * the type of timer and the timer is now considered tow
+ * be active. On timer expiry the associated callback
+ * will be called.
+ */
+int Mockit_arm(struct mockit *timer){
+    assert(timer);
 
-    if(mit->is_cyclic__){
-        return Mockit_getit(mit);
+    if(timer->is_cyclic__){
+        return Mockit_getit(timer);
     }
     else{
-        int rc = Mockit_oneoff(mit);
-        say(DEBUG, "returning rc=%i\n", rc);
-        //return Mockit_oneoff(mit);
-        return rc;
+        return Mockit_oneoff(timer);
     }
 }
 

@@ -229,6 +229,31 @@ int main(int argc, char **argv){
 }
 ```
 
+Calling `Mockit_destroy()` on a `one-off` timer is completely
+synonymous with calling `Mockit_disarm()` on it. The only situation
+where these make sense to be called is when the user arms a one-off
+timer set to a long timeout and then decides to disarm the
+respective timer before it wakes up. Normally the timer would call
+its associated callback on wakeup; if disarmed, however, it will
+refrain from doing that.
+
+Below is an illustration of this scenario:
+```C
+void mycb(void *t){
+    puts("called");
+}
+
+int main(int argc, char **argv){
+    struct mockit mit;
+    Mockit_static_init(&mit, mycb, 2000, false, NULL, NULL);
+    Mockit_arm(&mit);
+
+    Mockit_bsleep(1000, true, NULL);
+    Mockit_disarm(&mit); /* if disarmed, it will not call mycb */
+    Mockit_bsleep(1200, true, NULL);
+}
+```
+
 ### Interval timers
 
 While one-off timers are inherently self-disarming, interval aka
@@ -307,12 +332,13 @@ int main(int argc, char **argv){
 This section will summarize/explain the details of timer termination
 and cleanup mostly from the C perspective.
 
-One-off timers _cannot_ be disarmed. They are self-disarming: they run
-_once_ and then they terminate. The thread they run in is _detached_
-so one-off timers cannot and need not be joined. Default cleanup is
-sufficient _unless_ the user opts to use the `ctx` field for arbitrary
-(e.g. dynamically-allocated) data in which case a destructor should
-be  registered such that resources are properly released.
+One-off timers normally need not be disarmed (see the section above
+on one-off timers). They are self-disarming: they run _once_ and then
+they terminate. The thread they run in is _detached_ so one-off timers
+cannot and need not be joined. Default cleanup is sufficient _unless_
+the user opts to use the `ctx` field for arbitrary (e.g.
+dynamically-allocated) data in which case a destructor should be
+registered such that resources are properly released.
 
 Conversely, interval timers will run until explicitly disarmed.
 
@@ -369,8 +395,9 @@ It's vital to keep the following points in mind:
    cleanup and is _necessary_ because the interval-timer threads are
    _not_ detached.
 
- * one-off timers _cannot_ be destroyed. They're only disarmed and
-   then they terminate when they get around to it. Calling
+ * one-off timers _cannot_ be 'destroyed'. They're only disarmed
+   (automatically after a first sleep or manually if before then)
+   and then they terminate when they get around to it. Calling
    `Mockit_destroy()` on a one-shot timer is completely synonymous
    with caling `Mockit_disarm()` on it.
 
@@ -415,10 +442,12 @@ local mit = require("luamockit")
 -- get an integral millisecond timestamp
 local msts = mit.mstimestamp() -- e.g. 1659732124334
 
+
 -- get a time tuple of seconds since the epoch and milliseconds since
 -- the last second; on error, (nil, error code) tuple returned instead
 local s,ms = mit.time()        -- e.g. 1659732124, 334
 if not s then print("time failed with error code " .. ms)
+
 
 -- sleep for 2.3 seconds; resume if interrupted by a signal handler etc
 mit.sleep(2300, true)
@@ -429,38 +458,54 @@ local error_code, time_left = mit.sleep(70) -- same as lmit.sleep(2300, false)
 
 -------------------------------------------------------------------------
 
+
 -- dummy callback to be associated with timer expiry events
 local function cb()
     print(string.format("called callback at %s", mit.mstimestamp()))
 end
 
+
 ---------------------------------------------------------------
 -- one-off timer example: process event after arbitrary time --
 ---------------------------------------------------------------
+
+-- create and arm one-off timer to expire in 2 seconds.
 mit.oneoff(2000, cb)
---- do stuff (or sleep) for arbitrary period of time ---
+
+--[[ .. do stuff (or sleep) for arbitrary period of time .. ]]
+
+-- for difference between pending and non-pending events, see
+-- 'Enqueued Events and Pending Events' in docs/luamockit.md
+local pending = mit.pending()  -- total pending events
+local count = mit.inqueue()    -- total entries in the queue
 
 -- 1 or 0 depending on whether the timer has expired
-pending = mit.pending()
 print("pending = " .. pending)
+print("count = " .. count)
 
 -- this will call cb IFF the timer has in fact expired and the
 -- resulting timer expiry event has been enqueued
-mit.process_events()
+local processed = mit.process_events()
+print("processed " .. procesed .. " events") -- 1 if timer did expire else 0
+
 
 ----------------------------------------------------
 -- one-off timer example: block until event ready --
 ----------------------------------------------------
+
+-- create and arm one-off timer to expire in 3.5 seconds
 mit.oneoff(3500, cb)
 
 -- only unblocks on event enqueue or (optional) specified ms timeout
 mit.wait(8000)
 mit.process_events()
 
+
 ----------------------------------------------------------------
 -- interval timer example: process event after arbitrary time --
 ----------------------------------------------------------------
--- generate expiry event every 0.2 secs
+
+-- create and arm interval timer to generate expiry event every 0.2 secs
 local it = mit.getit(200, cb)
 
 -- do stuff or sleep for arbitrary length of time
@@ -471,6 +516,7 @@ mit.process_events()      -- call cb as a result of timer expiry events
 -- wait indefinitely to properly clean up timer-associated resources;
 -- remove references to object so it can be garbage collected
 it = it:destroy(true)
+
 
 ----------------------------------------------------
 -- interval timer example: process events forever --
@@ -495,14 +541,15 @@ it3 = mit.getit(3333, cb3)
 
 while true do
     mit.wait() -- block indefinitely until event ready
-    mit.process_events()  -- process events _sequentially_
+    local p = mit.process_events()  -- process events _sequentially_
+    print("processed " .. p .. " events")
 end
 ```
 
 ## Luamockit Design and Implementation notes
 
   * For a more extensive discussion on the motivations that ultimately
-    led to this design, see `docs/luamockit.md`. 
+    led to this design, see `docs/luamockit.md`.
 
 Interval and one-off timers generate an 'event' on expiry.
 The event is simply a structure that contains some internal details,
@@ -565,7 +612,7 @@ Tests
 
 There are tests for both the `C` library and the `Lua` library.
 Note that most tests verify the accuracy of one-off or interval
-timers. One or more tests failing is **not cause for alarm**. 
+timers. One or more tests failing is **not cause for alarm**.
 As mentioned above, applications cannot guarantee real-time
 constraints on Linux. Python's `sleep`, for example, is subject
 to the same affliction.
@@ -573,7 +620,7 @@ to the same affliction.
 The primary point of the tests is to _sanitize_ the state of the
 implementation: one test failing is not concern. Most tests failing
 definitely is. Particularly, tests for `sleep` and `mstimestamp`
-should normally never fail. 
+should normally never fail.
 
 The `C` tests are particularly useful for running through valgrind to
 validate there are no memory leaks, invalid reads and writes etc.
@@ -589,5 +636,3 @@ Todos
 --------
 
     * increase fixed-width int type used from 32 to 64 bits
-    * fix pending count for one-off timers
-    * add new function `inqueue` and expand example code here

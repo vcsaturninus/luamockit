@@ -224,10 +224,11 @@ Specifically, when the user calls `destroy()` on an interval timer:
    destructor, then exits its thread.
  * the custom destructor places another event (`MOD`-marked) in the
    queue
- * the `destroy()` function will look for `MFD` or `MOD`-marked events
-   associated with the timer in question. It skips the `MFD`-marked
-   event, and it releases all resources associated with the timer
-   when it sees the `MOD`-marked event.
+ * the `destroy()` function **skips** all `pending` events for the
+   timer in question (handling them does not make sense now since the
+   user has asked that it be destroyed). It also skips the
+   `MFD`-marked event. When it finally sees the `MOD`-marked events
+   `it releases all resources associated with the timer.
  * the `destroy()` function then `joins` the exited thread so that its
    thread resources can be released back to the system
  * the timer is now considered destroyed and the function returns
@@ -243,15 +244,16 @@ Interval timers that are marked with either `MFD` or `MOD` are not
 handled, i.e. the associated `Lua` callback is **not** called. It
 makes sense for this to be so because both of these follow the
 instant when the user calls `destroy()` on the given interval timer.
-Any subsequent events for the timer should therefore be discarded.
-Only two events follow after the point when the user calls
+Any subsequent events (and any already in the queue) for the timers
+should therefore be discarded.
+Only two new events follow after the point when the user calls
 `destroy()`: one carrying the `MFD` mark, one carrying the `MOD` mark.
 These are consequently both not handled but are necessary for
 `luamockit` to perform correct cleanup of resources.
 
 There are therefore two types of events in the event queue at any
-given time: events that to be handled, and events that will not be
-handled.
+given time: events to be handled i.e. 'pending events', and events
+that will not be handled.
 
 `luamockit` exposes two functions to get these numbers:
  * `pending()` will return the number of events currently in the queue

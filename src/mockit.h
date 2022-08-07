@@ -63,9 +63,8 @@
  * __ -postfixed members are set by the library functions and should not
  * be modified by the user other than via the init function.
  * The `ctx` field is reserved for arbitrary use by the user. If used,
- * the user should provide a destructor function that knows how free
- * it as well if necessary.
- */
+ * the user should provide a destructor function that knows how to free
+ * it as well if necessary. */
 struct mockit{
     pthread_t thread_id__;    // thread_id for timer thread created for each one-shot or interval timer
     uint8_t is_cyclic__  : 1, // flag to mark interval timers; these are destroyed differently from one-off timers
@@ -73,8 +72,8 @@ struct mockit{
             free_mem__   : 1; // used to let the timer thread know (not) to call free() on the `struct mockit`
     void   *ctx;              // for arbitrary use by the user; if used, destructor should be provided as well
     uint32_t timeout__;       // number of milliseconds before (one-off or interval) callback gets called
-    void (*cb)(void *mockit); // function to call on expiry of one-off or interval timer
-    int (*destructor)(void *ctx); // optional function to call on timer termination to release resources
+    void (*cb)(void *timer);  // function to call on expiry of one-off or interval timer
+    int (*destructor)(void *timer); // optional function to call on timer termination to release resources
 };
 
 int Mockit_gettime(time_t *secs, long *ms);
@@ -84,24 +83,24 @@ int Mockit_mstimestamp(uint64_t *timestamp);
 int Mockit_bsleep(uint32_t milliseconds, bool do_restart, uint32_t *time_left);
 
 void Mockit_static_init(
-                             struct mockit *mit,
-                             void (*cb)(void *mockit),
+                             struct mockit *timer,
+                             void (*cb)(void *timer),
                              uint32_t timeout,
                              bool cyclic,
                              void *ctx,
-                             int (*destructor)(void *mockit)
+                             int (*destructor)(void *timer)
                              );
 
 struct mockit *Mockit_dynamic_init(
-                             void (*cb)(void *mockit),
+                             void (*cb)(void *timer),
                              uint32_t timeout,
                              bool cyclic,
                              void *ctx,
-                             int (*destructor)(void *mockit)
+                             int (*destructor)(void *timer)
                              );
 
-int Mockit_arm(struct mockit *mit);
-void Mockit_disarm(struct mockit *mit);
-int Mockit_destroy(struct mockit *dt);
+int Mockit_arm(struct mockit *timer);
+void Mockit_disarm(struct mockit *timer);
+int Mockit_destroy(struct mockit *timer);
 
 #endif
