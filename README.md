@@ -453,7 +453,7 @@ if not s then print("time failed with error code " .. ms)
 mit.sleep(2300, true)
 
 -- sleep for 0.07 seconds; just stop if interrupted; if
-interruped/failed, an (error code, time left) tuple is returned
+-- interruped/failed, an (error code, time left) tuple is returned
 local error_code, time_left = mit.sleep(70) -- same as lmit.sleep(2300, false)
 
 -------------------------------------------------------------------------
@@ -635,4 +635,5 @@ The tests can be run as follows:
 Todos
 --------
 
-    * increase fixed-width int type used from 32 to 64 bits
+ * increase fixed-width int type used from 32 to 64 bits
+
