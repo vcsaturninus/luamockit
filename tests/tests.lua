@@ -1,4 +1,4 @@
-#!/usr/bin/env lua
+#!/usr/bin/lua5.3
 
 package.path = package.path .. ";./aux/?.lua;../aux/?.lua;"
 package.cpath = package.cpath .. ";./out/?.so;../out/?.so;"
