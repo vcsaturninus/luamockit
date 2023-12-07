@@ -1,3 +1,7 @@
+TO BE DELETED -- library rewritten and absorbed into [libtarp](https://github.com/vcsaturninus/libtarp). Lua bindings pending.
+=================================================
+
+
 Mockit - C and Lua timer callback library
 ==================================================
 
